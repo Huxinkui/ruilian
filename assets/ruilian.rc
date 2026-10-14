@@ -1,0 +1,30 @@
+#pragma code_page(65001)
+1 ICON "app.ico"
+1 24 "ruilian.manifest"
+1 VERSIONINFO
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "080404b0"
+  BEGIN
+   VALUE "CompanyName", "\0"
+   VALUE "FileDescription", "进销存与往来管理系统数据服务\0"
+   VALUE "FileVersion", "1.1.0.0\0"
+   VALUE "InternalName", "ruilian\0"
+   VALUE "OriginalFilename", "数据服务.exe\0"
+   VALUE "ProductName", "进销存与往来管理系统\0"
+   VALUE "ProductVersion", "1.1.0\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0804, 1200
+ END
+END

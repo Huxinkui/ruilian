@@ -1,0 +1,12 @@
+export const money = (value: any) => value === null || value === undefined ? '—' : Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+export const quantity = (value: any) => value === null || value === undefined ? '—' : Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
+export const dateTime = (value: any) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'
+export const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` }
+export const monthStart = () => today().slice(0, 8) + '01'
+export const statusLabels: Record<string, string> = { draft: '草稿', submitted: '待审核', approved: '已审核', in_progress: '执行中', completed: '已完成', cancelled: '已作废', reversed: '已红冲', closed: '已关闭', active: '已授权', trial: '试用中', expired: '试用到期', abnormal: '授权异常', ok: '正常', partial: '部分失败', failed: '失败', in: '在库', out: '已出库' }
+export const statusType = (status: string): 'primary' | 'success' | 'info' | 'warning' | 'danger' => ({ draft: 'info', submitted: 'warning', approved: 'primary', in_progress: 'primary', completed: 'success', cancelled: 'info', reversed: 'danger', closed: 'info', active: 'success', trial: 'primary', expired: 'warning', abnormal: 'danger', ok: 'success', partial: 'warning', failed: 'danger', in: 'success', out: 'info' }[status] as any || 'info')
+export const modules: Record<string, string> = { purchase: '采购管理', sales: '销售管理', inventory: '库存管理', finance: '往来管理' }
+export const masterLabels: Record<string, string> = { product: '商品档案', customer: '客户档案', supplier: '供应商档案', warehouse: '仓库管理', location: '库位管理', category: '商品分类', brand: '品牌', unit: '计量单位', employee: '员工 / 业务员', organization: '组织架构', dictionary: '数据字典' }
+export function fileSize(n: number) { return n > 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB' }
+export function itemModule(kind: string) { if (kind.startsWith('purchase_')) return 'purchase'; if (kind.startsWith('sales_') || kind.startsWith('consignment_') || kind === 'retail_sale') return 'sales'; if (kind.startsWith('ar_') || kind.startsWith('ap_') || kind === 'opening_ar' || kind === 'opening_ap') return 'finance'; return 'inventory' }
+export const escapeHTML = (value: any) => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))

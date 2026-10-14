@@ -1,0 +1,14 @@
+/data/
+/release/
+/publisher-private/
+/frontend/node_modules/
+/desktop/node_modules/
+/web/dist/
+/artifacts/
+*.log
+*.test
+*.exe
+*.db
+*.db-shm
+*.db-wal
+/.tools/

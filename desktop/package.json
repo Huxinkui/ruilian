@@ -1,0 +1,84 @@
+{
+  "name": "ruilian-desktop",
+  "version": "1.1.0",
+  "description": "进销存与往来管理系统桌面客户端",
+  "author": "",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win --x64 --dir",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "cn.ruilian.erp",
+    "productName": "进销存管理系统",
+    "copyright": "",
+    "asar": true,
+    "directories": {
+      "output": "../release/client",
+      "buildResources": "../assets"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "loading.html",
+      "branding.json",
+      "package.json",
+      "fonts/**",
+      "images/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../artifacts/desktop-backend/数据服务.exe",
+        "to": "backend/数据服务.exe"
+      },
+      {
+        "from": "../assets/app.ico",
+        "to": "app.ico"
+      },
+      {
+        "from": "../docs/使用说明.md",
+        "to": "使用说明.txt"
+      },
+      {
+        "from": "../docs/第三方许可证.txt",
+        "to": "第三方许可证.txt"
+      },
+      {
+        "from": "../docs/字体图标与品牌配置.md",
+        "to": "字体图标与品牌配置.txt"
+      }
+    ],
+    "win": {
+      "icon": "../assets/app.ico",
+      "target": [
+        "nsis"
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "进销存管理系统安装程序-${version}-${arch}.${ext}",
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "进销存管理系统",
+      "uninstallDisplayName": "进销存与往来管理系统",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "language": "2052"
+    }
+  }
+}

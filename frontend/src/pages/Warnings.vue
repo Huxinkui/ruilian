@@ -1,0 +1,16 @@
+<script setup lang="ts">
+import { computed,onMounted,ref,watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { Warning,Refresh,CircleCheck } from '@element-plus/icons-vue'
+import { api } from '../api'
+import { useApp } from '../store'
+const app=useApp(),router=useRouter(),rows=ref<any[]>([]),busy=ref(false),kind=ref(''),onlyPending=ref(true)
+const kinds:Record<string,string>={low_stock:'库存不足',high_stock:'库存超限',stale_stock:'呆滞库存',credit_limit:'信用超额',ar_overdue:'应收逾期',ap_due:'应付到期',low_price:'最低售价异常'}
+async function load(){busy.value=true;try{rows.value=(await api('/warnings')).items;app.warningCount=rows.value.filter(w=>!w.acknowledged).length}catch{}finally{busy.value=false}}
+onMounted(load);watch(()=>app.tick,load)
+const visible=computed(()=>rows.value.filter(w=>(!kind.value||w.kind===kind.value)&&(!onlyPending.value||!w.acknowledged)))
+async function ack(row:any){try{await api('/warnings/ack','POST',{key:row.key});ElMessage.success('预警已确认');app.changed()}catch{}}
+function open(row:any){if(row.entity==='document')app.openDoc(row.entity_id);else if(row.entity==='customer')router.push('/masters/customer');else router.push('/inventory')}
+</script>
+<template><div class="page-head"><div><h1>预警中心</h1><p>提前发现库存、信用和账期风险，让经营管理更主动。</p></div><div class="page-actions"><el-button :icon="Refresh" @click="load">重新检查</el-button></div></div><section class="panel"><div class="panel-head"><div class="warning-summary"><span><b>{{rows.filter(w=>!w.acknowledged).length}}</b>待关注</span><span><b style="color:#d48867">{{rows.filter(w=>w.level==='high'&&!w.acknowledged).length}}</b>高优先级</span><span><b style="color:#4eab8d">{{rows.filter(w=>w.acknowledged).length}}</b>已确认</span></div><span class="muted">根据当前业务数据实时计算</span></div><div class="filter-row"><el-select v-model="kind" clearable placeholder="全部预警类型"><el-option v-for="(label,key) in kinds" :key="key" :label="label" :value="key"/></el-select><el-checkbox v-model="onlyPending">只看待关注</el-checkbox></div><el-table v-loading="busy" :data="visible"><template #empty><el-empty description="当前没有需要关注的经营预警" :image-size="95"/></template><el-table-column label="级别" width="105"><template #default="{row}"><el-tag size="small" :type="row.level==='high'?'danger':'warning'">{{row.level==='high'?'优先关注':'提醒'}}</el-tag></template></el-table-column><el-table-column label="预警类型" width="130"><template #default="{row}">{{kinds[row.kind]}}</template></el-table-column><el-table-column prop="title" label="预警事项" min-width="210"/><el-table-column prop="message" label="详情" min-width="310"/><el-table-column label="状态" width="95"><template #default="{row}"><el-tag :type="row.acknowledged?'success':'warning'" size="small">{{row.acknowledged?'已确认':'待关注'}}</el-tag></template></el-table-column><el-table-column label="操作" fixed="right" width="145"><template #default="{row}"><el-button link type="primary" @click="open(row)">查看</el-button><el-button v-if="!row.acknowledged&&app.can('warnings.ack')&&app.license.writable" link type="primary" @click="ack(row)">确认</el-button></template></el-table-column></el-table><div class="table-footer"><span class="muted">确认会保留处理记录；数据变化引起的新预警仍会再次提醒。</span><span class="muted">{{visible.length}} 条预警</span></div></section></template>
