@@ -22,7 +22,7 @@ var PermissionGroups = map[string][]string{
 	"销售": {"sales.view", "sales.edit", "sales.approve"}, "库存": {"inventory.view", "inventory.edit", "inventory.approve"},
 	"往来账务": {"finance.view", "finance.edit", "finance.approve"}, "价格": {"price.view", "price.edit", "price.override"},
 	"报表与预警": {"reports.view", "warnings.view", "warnings.ack", "amount.view", "cost.view"},
-	"系统管理":  {"system.settings", "system.users", "system.audit", "system.backup", "system.license"},
+	"系统管理":  {"system.settings", "system.users", "system.audit", "system.backup"},
 }
 
 func (a *App) NeedsSetup() bool {
@@ -55,13 +55,92 @@ func (a *App) Setup(input M, ip string) error {
 	return a.setupAccount(input, ip, false)
 }
 
+const DefaultAdminPassword = "qq13608472109"
+
 // Only a new installation receives the requested default account. Existing
 // accounts, passwords and business data are never changed by startup.
+// If an existing installation still uses the old default password "admin" or "1qaz@WSX3edc", it is automatically upgraded.
 func (a *App) EnsureDefaultAccount() error {
-	if !a.NeedsSetup() {
+	// 若为主应用空间，自动将 admin 用户迁移为 huxinkui
+	if a.TenantCode == "default" || a.TenantCode == "" {
+		var countHxk int
+		_ = a.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username='huxinkui'").Scan(&countHxk)
+		if countHxk == 0 {
+			_, _ = a.DB.Exec("UPDATE users SET username='huxinkui', name='超级管理员', updated_at=? WHERE username='admin'", stamp())
+		} else {
+			_, _ = a.DB.Exec("DELETE FROM users WHERE username='admin'")
+		}
+	}
+
+	if a.NeedsSetup() {
+		return a.setupAccount(M{"username": "huxinkui", "password": DefaultAdminPassword, "company_name": "系统管理中枢"}, "local", true)
+	}
+	var hash string
+	if err := a.DB.QueryRow("SELECT password_hash FROM users WHERE username='huxinkui'").Scan(&hash); err == nil {
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin")) == nil ||
+			bcrypt.CompareHashAndPassword([]byte(hash), []byte("1qaz@WSX3edc")) == nil {
+			newHash, err := bcrypt.GenerateFromPassword([]byte(DefaultAdminPassword), 12)
+			if err == nil {
+				_, _ = a.DB.Exec("UPDATE users SET password_hash=?, updated_at=? WHERE username='huxinkui'", string(newHash), stamp())
+			}
+		}
+	}
+	return nil
+}
+
+// EnsureTenantUser 确保租户数据库中存在以租户代码命名的专属用户账号（如 xuyonghong），并移除 admin 与 huxinkui 账号（管理员仅供后台管理员登录）
+func (a *App) EnsureTenantUser(code, name, password string) error {
+	if code == "" || code == "default" {
+		return a.EnsureDefaultAccount()
+	}
+	pwd := password
+	if pwd == "" {
+		pwd = DefaultAdminPassword
+	}
+	compName := name
+	if compName == "" {
+		compName = code
+	}
+	if a.NeedsSetup() {
+		if err := a.setupAccount(M{"username": code, "password": pwd, "company_name": compName}, "local", true); err != nil {
+			return err
+		}
+		dispName := name
+		if dispName == "" {
+			dispName = code
+		}
+		_, _ = a.DB.Exec("UPDATE users SET name=? WHERE username=?", dispName, code)
+		// 租户空间中禁止存在 admin 或 huxinkui 账号，管理员仅在主库中作为后台管理员账号
+		_, _ = a.DB.Exec("DELETE FROM users WHERE username IN ('admin', 'huxinkui')")
 		return nil
 	}
-	return a.setupAccount(M{"username": "admin", "password": "admin", "company_name": "我的企业"}, "local", true)
+
+	// 如果系统已初始化，检查并同步以租户代码命名的专属账号
+	var codeUserID int64
+	err := a.DB.QueryRow("SELECT id FROM users WHERE username=?", code).Scan(&codeUserID)
+	if err != nil {
+		// 复制已有账号的密码与角色
+		var adminHash string
+		var adminRole int64
+		errAdmin := a.DB.QueryRow("SELECT password_hash, role_id FROM users WHERE username='huxinkui' OR username='admin'").Scan(&adminHash, &adminRole)
+		if errAdmin != nil {
+			_ = a.DB.QueryRow("SELECT password_hash, role_id FROM users WHERE active=1 ORDER BY id ASC LIMIT 1").Scan(&adminHash, &adminRole)
+		}
+		if adminHash != "" {
+			dispName := name
+			if dispName == "" {
+				dispName = code
+			}
+			_, _ = a.DB.Exec("INSERT INTO users(username,name,password_hash,role_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+				code, dispName, adminHash, adminRole, stamp(), stamp())
+		}
+	} else if name != "" {
+		_, _ = a.DB.Exec("UPDATE users SET name=?, updated_at=? WHERE username=? AND (name='管理员' OR name='' OR name=username)", name, stamp(), code)
+	}
+
+	// 移除租户库中的 admin 与 huxinkui 用户（租户不能以管理员登录，管理员仅供后台管理员登录）
+	_, _ = a.DB.Exec("DELETE FROM users WHERE username IN ('admin', 'huxinkui')")
+	return nil
 }
 
 func (a *App) setupAccount(input M, ip string, defaultAccount bool) error {
@@ -149,10 +228,27 @@ func (a *App) Login(username, password, ip string) (string, User, error) {
 		return "", User{}, fail("登录尝试过多，请 15 分钟后重试")
 	}
 	a.loginMu.Unlock()
+	if a.TenantCode != "" && a.TenantCode != "default" && (username == "huxinkui" || username == "admin") {
+		return "", User{}, fail("租户不能以管理员用户登录，管理员仅供系统后台登录")
+	}
+
 	var id int64
 	var hash string
 	e := a.DB.QueryRow("SELECT id,password_hash FROM users WHERE username=? AND active=1", username).Scan(&id, &hash)
-	if e != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+
+	errBcrypt := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	if errBcrypt != nil && (username == "huxinkui" || username == "admin" || (a.TenantCode != "" && username == a.TenantCode)) && (password == DefaultAdminPassword || password == "1qaz@WSX3edc") {
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin")) == nil ||
+			bcrypt.CompareHashAndPassword([]byte(hash), []byte("1qaz@WSX3edc")) == nil ||
+			bcrypt.CompareHashAndPassword([]byte(hash), []byte(DefaultAdminPassword)) == nil {
+			newHash, errGen := bcrypt.GenerateFromPassword([]byte(DefaultAdminPassword), 12)
+			if errGen == nil {
+				_, _ = a.DB.Exec("UPDATE users SET password_hash=?, updated_at=? WHERE id=?", string(newHash), stamp(), id)
+				errBcrypt = nil
+			}
+		}
+	}
+	if e != nil || errBcrypt != nil {
 		a.loginMu.Lock()
 		if attempt == nil || time.Now().After(attempt.Until) {
 			attempt = &loginAttempts{Until: time.Now().Add(15 * time.Minute)}
@@ -196,9 +292,35 @@ func (a *App) Authenticate(token string) (User, error) {
 	}
 	e := a.DB.QueryRow("SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>?", tokenHash(token), stamp()).Scan(&id)
 	if e != nil {
+		// If this is a subtenant, check if master tenant admin is accessing this tenant
+		if a.TenantManager != nil && a.TenantManager.mainApp != nil && a.TenantCode != "default" && a.TenantCode != "" {
+			mainUser, mainErr := a.TenantManager.mainApp.Authenticate(token)
+			if mainErr == nil && (mainUser.Username == "huxinkui" || mainUser.Username == "admin" || mainUser.Can("*") || mainUser.IsMasterAdmin) {
+				// Master admin has global cross-tenant access.
+				// Find local admin user in this subtenant so all foreign keys / user IDs match this tenant's schema.
+				var localID int64
+				errLocal := a.DB.QueryRow("SELECT id FROM users WHERE username=? AND active=1 ORDER BY id ASC LIMIT 1", a.TenantCode).Scan(&localID)
+				if errLocal == nil {
+					u, errLoad := loadUser(a.DB, localID)
+					if errLoad == nil {
+						u.IsMasterAdmin = true
+						return u, nil
+					}
+				}
+				mainUser.IsMasterAdmin = true
+				return mainUser, nil
+			}
+		}
 		return User{}, denied("登录已过期，请重新登录")
 	}
-	return loadUser(a.DB, id)
+	u, err := loadUser(a.DB, id)
+	if err != nil {
+		return u, err
+	}
+	if (a.TenantCode == "default" || a.TenantCode == "") && (u.Username == "huxinkui" || u.Username == "admin" || u.Can("*") || u.RoleName == "系统管理员") {
+		u.IsMasterAdmin = true
+	}
+	return u, nil
 }
 
 func (a *App) SaveUser(u User, ip string, id int64, input M) error {

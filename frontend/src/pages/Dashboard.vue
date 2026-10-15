@@ -1,14 +1,28 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ArrowRight, Refresh, ShoppingCart, Sell, Wallet, Box, TrendCharts, Warning, CircleCheck, Plus, DocumentChecked, Van, Money } from '@element-plus/icons-vue'
+import { ArrowRight, Refresh, ShoppingCart, Sell, Wallet, Box, TrendCharts, Warning, CircleCheck, Plus, DocumentChecked, Van, Money, OfficeBuilding, Setting } from '@element-plus/icons-vue'
 import Chart from '../components/Chart.vue'
+import AdminDashboard from './AdminDashboard.vue'
 import { api } from '../api'
 import { useApp } from '../store'
 import { money, quantity, statusLabels, statusType, escapeHTML } from '../utils'
 const app = useApp(), router = useRouter(), busy = ref(false)
+
+const isMasterAdminInMain = computed(() => {
+  return (app.user?.username === 'huxinkui' || app.isMasterAdmin) && (app.tenant?.code === 'default' || !app.tenant?.code)
+})
 const data = ref<any>({ trend: [], warehouses: [], aging: [], pending: [], warnings: [], sales: '0', purchase: '0', gross_profit: '0', gross_margin: '0', inventory_value: '0', ar: '0', ap: '0', ar_advance: '0', ap_advance: '0', reserved: '0', sku_count: 0, pending_count: 0, warning_count: 0 })
-async function load() { busy.value = true; try { data.value = await api('/dashboard'); app.warningCount = data.value.warning_count } catch {} finally { busy.value = false } }
+async function load() {
+  if (isMasterAdminInMain.value) return
+  busy.value = true
+  try {
+    data.value = await api('/dashboard')
+    app.warningCount = data.value.warning_count
+  } catch {} finally {
+    busy.value = false
+  }
+}
 watch(() => app.tick, load); onMounted(load)
 const greeting = new Date().getHours() < 12 ? '上午好' : new Date().getHours() < 18 ? '下午好' : '晚上好'
 const metrics = computed(() => [
@@ -33,8 +47,26 @@ const agingOption = computed(() => ({ color: ['#7e9ee2'], tooltip: { trigger: 'a
 const shortcuts = computed(() => [{ name: '采购入库', kind: 'purchase_receipt', module: 'purchase', icon: ShoppingCart }, { name: '销售出库', kind: 'sales_delivery', module: 'sales', icon: Van }, { name: '客户收款', kind: 'ar_receipt', module: 'finance', icon: Wallet }, { name: '供应商付款', kind: 'ap_payment', module: 'finance', icon: Money }].filter(v => app.can(v.module + '.edit')))
 </script>
 <template>
-  <div v-loading="busy">
+  <!-- 管理员专属重设计的平台总控控制台 -->
+  <AdminDashboard v-if="isMasterAdminInMain" />
+
+  <!-- 普通租户或管理员跨空间巡检模式下的业务进销存工作台 -->
+  <div v-else v-loading="busy">
     <div class="page-head"><div><h1>{{ greeting }}，{{ app.user.name }}<span style="font-size:17px;margin-left:10px">☀</span></h1><p>经营动态一目了然，今天也让每一笔业务有条不紊。</p></div><div class="page-actions"><el-button :icon="Refresh" @click="load">刷新数据</el-button><el-dropdown v-if="shortcuts.length" trigger="click" @command="(kind: string) => app.openDoc(0, kind)"><el-button type="primary" :icon="Plus">新建业务单据</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="item in shortcuts" :key="item.kind" :command="item.kind" :disabled="!app.writable(item.module)">{{ item.name }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown></div></div>
+
+    <!-- 跨租户管理提示条（仅管理员跨租户时显示） -->
+    <div v-if="app.isMasterAdmin && app.tenant?.code && app.tenant?.code !== 'default'" class="cross-tenant-strip mb20">
+      <div class="cross-tenant-left">
+        <el-tag type="danger" effect="dark" size="small" class="cross-tenant-badge">跨租户监管中</el-tag>
+        <span>当前正在查看并监管租户：<b>{{ app.tenant.name || app.tenant.code }}</b>（代码：<code>{{ app.tenant.code }}</code>）</span>
+        <span class="cross-tenant-storage">存储已用：{{ (app.tenant.used_storage_mb || 0).toFixed(1) }} MB / {{ app.tenant.max_storage_mb ? app.tenant.max_storage_mb + ' MB' : '不限容量' }}</span>
+      </div>
+      <div class="cross-tenant-actions">
+        <el-button size="small" type="primary" plain @click="app.switchTenant('default')">返回平台控制台</el-button>
+        <el-button size="small" :icon="Setting" @click="router.push('/tenants')">多租户中心</el-button>
+      </div>
+    </div>
+
     <div class="metric-grid"><div v-for="metric in metrics" :key="metric.label" class="metric-card"><div class="metric-label"><span>{{ metric.label }}</span><div class="metric-icon" :class="metric.color"><el-icon><component :is="metric.icon"/></el-icon></div></div><div class="metric-value"><small>¥</small>{{ money(metric.value) }}</div><div class="metric-footer"><span>{{ metric.foot }}</span><b>{{ metric.tag }}</b></div></div></div>
     <div class="content-grid mb24"><section class="panel"><div class="panel-head"><div><h3>采购与销售走势</h3><p>最近 30 天已审核业务的净额</p></div><span class="pill">近 30 天</span></div><Chart v-if="app.amountVisible" :option="lineOption" :height="276"/><el-empty v-else description="当前角色未开放金额查看权限" :image-size="70"/><div class="mini-metrics"><div class="mini-metric"><label>本月采购额</label><strong>¥ {{ money(data.purchase) }}</strong></div><div class="mini-metric"><label>待付供应商款</label><strong>¥ {{ money(data.ap) }}</strong></div><div class="mini-metric"><label>销售订单占用</label><strong>{{ quantity(data.reserved) }}<small style="display:inline;margin-left:6px">数量</small></strong></div></div></section>
       <section class="panel"><div class="panel-head"><div><h3>待处理事项 <el-tag v-if="data.pending_count" size="small" type="warning" style="margin-left:6px">{{ data.pending_count }}</el-tag></h3><p>审核单据后，自动更新库存与账务</p></div><el-icon color="#98a9bf"><DocumentChecked/></el-icon></div><div v-if="data.pending.length"><div v-for="doc in data.pending" :key="doc.id" class="list-item"><div class="record-icon"><el-icon><DocumentChecked/></el-icon></div><div class="list-item-info"><strong>{{ doc.kind_name }} · {{ doc.partner_name || doc.warehouse_name }}</strong><small>{{ doc.number }}</small></div><el-button link type="primary" @click="app.openDoc(doc.id)">处理</el-button></div></div><el-empty v-else description="暂无待审核单据，一切井然有序" :image-size="74" style="padding:34px 0 22px"/><div class="panel-head" style="border-top:1px solid #f0f3f7;border-bottom:0;padding-bottom:8px"><h3>常用业务</h3><span class="muted text-small">快捷开单</span></div><div class="action-cards"><button v-for="item in shortcuts" :key="item.kind" class="action-card" :disabled="!app.writable(item.module)" @click="app.openDoc(0, item.kind)"><el-icon><component :is="item.icon"/></el-icon>{{ item.name }}</button></div></section>
@@ -42,4 +74,89 @@ const shortcuts = computed(() => [{ name: '采购入库', kind: 'purchase_receip
     <div class="dashboard-bottom"><section class="panel"><div class="panel-head"><h3>库存金额分布</h3><el-button v-if="app.can('inventory.view')" link type="primary" @click="router.push('/inventory')">库存明细 <el-icon><ArrowRight/></el-icon></el-button></div><Chart v-if="app.costVisible" :option="pieOption" :height="235"/><el-empty v-else description="成本数据按权限隐藏" :image-size="65"/><div class="chart-note">按仓库统计 · 包含委托库存</div></section><section class="panel"><div class="panel-head"><h3>应收账龄</h3><el-button v-if="app.can('finance.view')" link type="primary" @click="router.push('/finance?view=aging')">查看 <el-icon><ArrowRight/></el-icon></el-button></div><Chart v-if="app.amountVisible" :option="agingOption" :height="235"/><el-empty v-else description="金额数据按权限隐藏" :image-size="65"/><div class="chart-note">按到期日计算 · 未核销应收账款</div></section><section class="panel"><div class="panel-head"><h3>经营预警 <span v-if="data.warning_count" class="pill" style="margin-left:5px;color:#bc8a45;background:#fff5e6">{{ data.warning_count }}</span></h3><el-button v-if="app.can('warnings.view')" link type="primary" @click="router.push('/warnings')">全部 <el-icon><ArrowRight/></el-icon></el-button></div><div v-if="data.warnings.length"><div v-for="warning in data.warnings.slice(0, 4)" :key="warning.key" class="list-item"><div class="list-item-icon"><el-icon><Warning/></el-icon></div><div class="list-item-info"><strong>{{ warning.title }}</strong><small>{{ warning.message }}</small></div></div></div><el-empty v-else description="暂无经营预警" :image-size="72" style="padding-top:44px"/></section></div>
   </div>
 </template>
-<style scoped>.dashboard-bottom{display:grid;grid-template-columns:1fr 1fr 1.08fr;gap:20px}@media(max-width:1200px){.dashboard-bottom{grid-template-columns:1fr 1fr}.dashboard-bottom>.panel:last-child{grid-column:1/-1}}@media(max-width:800px){.dashboard-bottom{grid-template-columns:1fr}.dashboard-bottom>.panel:last-child{grid-column:auto}}</style>
+<style scoped>
+.dashboard-bottom{display:grid;grid-template-columns:1fr 1fr 1.08fr;gap:20px}
+@media(max-width:1200px){.dashboard-bottom{grid-template-columns:1fr 1fr}.dashboard-bottom>.panel:last-child{grid-column:1/-1}}
+@media(max-width:800px){.dashboard-bottom{grid-template-columns:1fr}.dashboard-bottom>.panel:last-child{grid-column:auto}}
+
+.cross-tenant-strip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  padding: 10px 16px;
+  border-radius: 8px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.cross-tenant-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #991b1b;
+  flex-wrap: wrap;
+}
+.cross-tenant-badge {
+  font-weight: 600;
+}
+.cross-tenant-left code {
+  background: #fee2e2;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+.cross-tenant-storage {
+  color: #7f1d1d;
+  font-size: 12px;
+  margin-left: 8px;
+}
+.cross-tenant-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.platform-admin-strip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  padding: 12px 18px;
+  border-radius: 10px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.platform-strip-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.platform-strip-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.platform-strip-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: #1e3a8a;
+  margin-bottom: 2px;
+}
+.platform-strip-desc {
+  margin: 0;
+  font-size: 12px;
+  color: #475569;
+}
+.mb20 {
+  margin-bottom: 20px;
+}
+</style>

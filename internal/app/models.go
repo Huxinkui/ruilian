@@ -180,6 +180,7 @@ type User struct {
 	Warehouses     []int64  `json:"warehouse_ids"`
 	DataScope      string   `json:"data_scope"`
 	OrganizationID int64    `json:"organization_id"`
+	IsMasterAdmin  bool     `json:"is_master_admin"`
 }
 
 func (u User) Can(p string) bool {

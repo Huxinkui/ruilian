@@ -17,16 +17,21 @@ import (
 )
 
 type App struct {
-	DB           *sql.DB
-	DataDir      string
-	writeMu      sync.Mutex
-	backupMu     sync.Mutex
-	License      *LicenseService
-	Stop         func()
-	DesktopToken string
-	loginMu      sync.Mutex
-	attempts     map[string]*loginAttempts
-	Logger       *log.Logger
+	DB            *sql.DB
+	DataDir       string
+	writeMu       sync.Mutex
+	backupMu      sync.Mutex
+	License       *LicenseService
+	Stop          func()
+	DesktopToken  string
+	loginMu       sync.Mutex
+	attempts      map[string]*loginAttempts
+	Logger        *log.Logger
+	TenantManager *TenantManager
+	TenantCode    string
+	PublicKey     []byte
+	CaptchaStore  *CaptchaStore
+	IPLimiter     *IPLoginLimiter
 }
 
 func Open(dataDir string, publicKey []byte, logger *log.Logger) (*App, error) {
@@ -55,7 +60,16 @@ func Open(dataDir string, publicKey []byte, logger *log.Logger) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("打开 SQLite %s: %w", u.String(), e)
 	}
-	a := &App{DB: db, DataDir: absDir, Logger: logger, attempts: map[string]*loginAttempts{}}
+	a := &App{
+		DB:           db,
+		DataDir:      absDir,
+		Logger:       logger,
+		attempts:     map[string]*loginAttempts{},
+		TenantCode:   "default",
+		PublicKey:    publicKey,
+		CaptchaStore: NewCaptchaStore(),
+		IPLimiter:    NewIPLoginLimiter(),
+	}
 	if a.Logger == nil {
 		a.Logger = log.Default()
 	}
@@ -80,6 +94,11 @@ func sqliteURIPath(path string) string {
 	return p
 }
 func (a *App) write(fn func(*sql.Tx) error) error {
+	if a.TenantManager != nil {
+		if err := a.TenantManager.CheckStorageQuota(a.TenantCode); err != nil {
+			return err
+		}
+	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	tx, e := a.DB.Begin()

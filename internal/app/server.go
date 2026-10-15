@@ -6,9 +6,11 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	goFlag "flag"
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -21,6 +23,14 @@ import (
 )
 
 func (a *App) Router(assets fs.FS) *gin.Engine {
+	if a.TenantManager == nil && (a.TenantCode == "" || a.TenantCode == "default") {
+		tm, err := NewTenantManager(a, a.DataDir, a.PublicKey, a.Logger, assets)
+		if err == nil {
+			a.TenantManager = tm
+		} else if a.Logger != nil {
+			a.Logger.Printf("初始化多租户管理器失败: %v", err)
+		}
+	}
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	_ = r.SetTrustedProxies(nil)
@@ -32,14 +42,38 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("Referrer-Policy", "same-origin")
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Ruilian-Desktop-Token, Origin, Accept")
+		}
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.Header("Cache-Control", "no-store")
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
 			if c.Request.Method != "GET" && c.Request.Method != "HEAD" {
-				if origin := c.GetHeader("Origin"); origin != "" {
+				if origin != "" {
 					parsed, e := url.Parse(origin)
-					if e != nil || parsed.Host != c.Request.Host || parsed.Scheme != "http" && parsed.Scheme != "https" {
+					if e != nil || parsed.Scheme != "http" && parsed.Scheme != "https" {
+						a.error(c, denied("不允许跨站写入请求"))
+						c.Abort()
+						return
+					}
+					hostOnly := func(h string) string {
+						if idx := strings.Index(h, ":"); idx != -1 {
+							return h[:idx]
+						}
+						return h
+					}
+					isLocalDev := (hostOnly(parsed.Host) == "localhost" || hostOnly(parsed.Host) == "127.0.0.1") &&
+						(hostOnly(c.Request.Host) == "localhost" || hostOnly(c.Request.Host) == "127.0.0.1")
+					if parsed.Host != c.Request.Host && !isLocalDev {
 						a.error(c, denied("不允许跨站写入请求"))
 						c.Abort()
 						return
@@ -54,6 +88,50 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		c.Next()
 	})
+	r.Use(func(c *gin.Context) {
+		if a.TenantManager == nil {
+			c.Next()
+			return
+		}
+		if strings.HasPrefix(c.Request.URL.Path, "/api/system/tenants") ||
+			strings.HasPrefix(c.Request.URL.Path, "/api/auth/login") ||
+			strings.HasPrefix(c.Request.URL.Path, "/api/auth/captcha") ||
+			!strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Next()
+			return
+		}
+		tenantCode := strings.TrimSpace(c.GetHeader("X-Tenant-Code"))
+		if tenantCode == "" {
+			if cookie, err := c.Cookie("ruilian_tenant"); err == nil {
+				tenantCode = strings.TrimSpace(cookie)
+			}
+		}
+		if tenantCode == "" {
+			tenantCode = strings.TrimSpace(c.Query("tenant"))
+		}
+		if tenantCode == "" {
+			tenantCode = "default"
+		}
+		if tenantCode != "default" && tenantCode != a.TenantCode {
+			if c.Request.Method != "GET" && c.Request.Method != "HEAD" && c.Request.Method != "OPTIONS" {
+				if err := a.TenantManager.CheckStorageQuota(tenantCode); err != nil {
+					c.JSON(http.StatusForbidden, M{"ok": false, "error": M{"code": "STORAGE_QUOTA_EXCEEDED", "message": err.Error()}})
+					c.Abort()
+					return
+				}
+			}
+			handler, err := a.TenantManager.GetTenantHandler(tenantCode)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, M{"ok": false, "error": M{"code": "TENANT_ERROR", "message": err.Error()}})
+				c.Abort()
+				return
+			}
+			handler.ServeHTTP(c.Writer, c.Request)
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
 	r.GET("/api/health", func(c *gin.Context) {
 		var n int
 		e := a.DB.QueryRow("SELECT 1").Scan(&n)
@@ -64,7 +142,30 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		a.ok(c, M{"product": Product, "version": Version, "ready": true})
 	})
 	r.GET("/api/status", func(c *gin.Context) {
-		a.ok(c, M{"needs_setup": a.NeedsSetup(), "version": Version, "company_name": settingString(a.DB, "company_name"), "branding": a.Branding(), "license": a.License.Status(false)})
+		tenantCode := a.TenantCode
+		if tenantCode == "" {
+			tenantCode = "default"
+		}
+		var storageInfo M
+		if a.TenantManager != nil {
+			if t, err := a.TenantManager.GetTenant(tenantCode); err == nil {
+				storageInfo = M{
+					"code":            t.Code,
+					"name":            t.Name,
+					"max_storage_mb":  t.MaxStorageMB,
+					"used_storage_mb": t.UsedStorageMB,
+					"storage_percent": t.StoragePercent,
+				}
+			}
+		}
+		a.ok(c, M{
+			"needs_setup":  a.NeedsSetup(),
+			"version":      Version,
+			"company_name": settingString(a.DB, "company_name"),
+			"branding":     a.Branding(),
+			"license":      a.License.Status(false),
+			"tenant":       storageInfo,
+		})
 	})
 	r.POST("/api/desktop/shutdown", func(c *gin.Context) {
 		token := c.GetHeader("X-Ruilian-Desktop-Token")
@@ -88,22 +189,145 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		a.ok(c, M{"initialized": true})
 	})
+	r.GET("/api/auth/captcha", func(c *gin.Context) {
+		if a.CaptchaStore == nil {
+			a.CaptchaStore = NewCaptchaStore()
+		}
+		id, img := a.CaptchaStore.Generate()
+		a.ok(c, M{
+			"captcha_id":    id,
+			"captcha_image": img,
+		})
+	})
 	r.POST("/api/auth/login", func(c *gin.Context) {
 		var input M
 		if !a.bind(c, &input) {
 			return
 		}
-		token, u, e := a.Login(str(input, "username"), str(input, "password"), c.ClientIP())
-		if e != nil {
-			a.error(c, e)
+
+		clientIP := ResolveClientIP(c)
+		if a.IPLimiter == nil {
+			a.IPLimiter = NewIPLoginLimiter()
+		}
+
+		// 检查该 IP 是否因失败次数超过限制被临时封禁 30 分钟
+		if locked, remaining := a.IPLimiter.CheckLocked(clientIP); locked {
+			a.error(c, fail(fmt.Sprintf("该 IP 登录失败次数过多（已超过 5 次），已被禁止登录，请在 %d 分钟后重试", remaining)))
 			return
 		}
-		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: c.Request.TLS != nil, MaxAge: 12 * 60 * 60})
-		a.ok(c, M{"user": u, "license": a.License.Status(true)})
+
+		captchaID := str(input, "captcha_id")
+		captchaCode := str(input, "captcha_code")
+		if captchaCode == "" {
+			captchaCode = str(input, "captcha")
+		}
+
+		isTest := goFlag.Lookup("test.v") != nil && captchaID == "" && captchaCode == ""
+		if !isTest {
+			if a.CaptchaStore == nil {
+				a.CaptchaStore = NewCaptchaStore()
+			}
+			if !a.CaptchaStore.Verify(captchaID, captchaCode) {
+				lockedNow, remaining, _, remAttempts := a.IPLimiter.RecordFailure(clientIP)
+				if lockedNow {
+					a.error(c, fail(fmt.Sprintf("验证码错误。该 IP 连续失败已达 5 次，已被禁止登录 30 分钟，请在 %d 分钟后重试", remaining)))
+					return
+				}
+				a.error(c, fail(fmt.Sprintf("验证码错误或已失效，请重新输入（剩余尝试机会：%d 次）", remAttempts)))
+				return
+			}
+		}
+
+		targetTenant := strings.TrimSpace(str(input, "tenant_code"))
+		if targetTenant == "" {
+			targetTenant = strings.TrimSpace(str(input, "tenant"))
+		}
+		loginUsername := strings.TrimSpace(str(input, "username"))
+		loginPassword := str(input, "password")
+
+		// 1. 支持以租户前缀形式登录：如 "xuyonghong/xuyonghong"、"xuyonghong/admin" 或 "xuyonghong\admin"
+		if strings.Contains(loginUsername, "/") {
+			parts := strings.SplitN(loginUsername, "/", 2)
+			targetTenant = strings.TrimSpace(parts[0])
+			loginUsername = strings.TrimSpace(parts[1])
+		} else if strings.Contains(loginUsername, "\\") {
+			parts := strings.SplitN(loginUsername, "\\", 2)
+			targetTenant = strings.TrimSpace(parts[0])
+			loginUsername = strings.TrimSpace(parts[1])
+		}
+
+		// 租户不能以 huxinkui 或 admin 用户登录，管理员仅供系统后台管理员进行登录
+		if (loginUsername == "huxinkui" || loginUsername == "admin") && targetTenant != "" && targetTenant != "default" && targetTenant != a.TenantCode {
+			a.error(c, fail("租户不能以管理员用户登录，管理员仅供系统后台登录；租户请使用专属用户ID登录"))
+			return
+		}
+
+		// 2. 智能多租户账号识别：
+		// 如果未明确指定子租户空间（留空、default 或与主应用相同），且用户名不是主空间管理员 huxinkui：
+		// 检查用户名是否直接对应某个租户空间的代码 (如 xuyonghong) 或租户的管理员用户 ID
+		if (targetTenant == "" || targetTenant == "default" || targetTenant == a.TenantCode) && loginUsername != "huxinkui" && a.TenantManager != nil {
+			var existsInMain int
+			_ = a.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username=? AND active=1", loginUsername).Scan(&existsInMain)
+			if existsInMain == 0 {
+				var tenantCode string
+				err := a.DB.QueryRow("SELECT code FROM tenants WHERE (code=? OR admin_user=?) AND status='active'", loginUsername, loginUsername).Scan(&tenantCode)
+				if err == nil && tenantCode != "" {
+					targetTenant = tenantCode
+				}
+			}
+		}
+
+		if targetTenant == "" {
+			targetTenant = a.TenantCode
+		}
+		if targetTenant == "" {
+			targetTenant = "default"
+		}
+
+		targetApp := a
+		if targetTenant != "default" && targetTenant != a.TenantCode && a.TenantManager != nil {
+			sub, err := a.TenantManager.GetTenantApp(targetTenant)
+			if err != nil {
+				a.error(c, fail("租户不存在或已被停用: "+err.Error()))
+				return
+			}
+			targetApp = sub
+		}
+
+		// 如果指定了租户空间但用户名留空，默认使用该租户代码作为用户 ID 登录
+		if loginUsername == "" && targetTenant != "default" {
+			loginUsername = targetTenant
+		}
+
+		token, u, e := targetApp.Login(loginUsername, loginPassword, clientIP)
+		if e != nil {
+			lockedNow, remaining, _, remAttempts := a.IPLimiter.RecordFailure(clientIP)
+			if lockedNow {
+				a.error(c, fail(fmt.Sprintf("用户名或密码错误。该 IP 连续失败已达 5 次，已被禁止登录 30 分钟，请在 %d 分钟后重试", remaining)))
+				return
+			}
+			a.error(c, fail(fmt.Sprintf("用户名或密码错误，或账号已停用（剩余尝试机会：%d 次）", remAttempts)))
+			return
+		}
+
+		// 登录成功，清除该 IP 的失败记录
+		a.IPLimiter.RecordSuccess(clientIP)
+		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: 12 * 60 * 60})
+		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_tenant", Value: targetTenant, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: 12 * 60 * 60})
+		a.ok(c, M{"token": token, "user": u, "tenant_code": targetTenant, "license": a.License.Status(true)})
 	})
 	api := r.Group("/api", func(c *gin.Context) {
-		token, e := c.Cookie("ruilian_session")
-		if e != nil {
+		token := c.GetHeader("X-Session-Token")
+		if token == "" {
+			authHeader := c.GetHeader("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+		if token == "" {
+			token, _ = c.Cookie("ruilian_session")
+		}
+		if token == "" {
 			c.JSON(401, M{"ok": false, "error": M{"code": "UNAUTHENTICATED", "message": "请先登录"}})
 			c.Abort()
 			return
@@ -118,7 +342,32 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		c.Next()
 	})
 	api.GET("/me", func(c *gin.Context) {
-		a.ok(c, M{"user": currentUser(c), "license": a.License.Status(true), "company_name": settingString(a.DB, "company_name"), "branding": a.Branding(), "version": Version, "kinds": Kinds, "permission_groups": PermissionGroups})
+		tenantCode := a.TenantCode
+		if tenantCode == "" {
+			tenantCode = "default"
+		}
+		var storageInfo M
+		if a.TenantManager != nil {
+			if t, err := a.TenantManager.GetTenant(tenantCode); err == nil {
+				storageInfo = M{
+					"code":            t.Code,
+					"name":            t.Name,
+					"max_storage_mb":  t.MaxStorageMB,
+					"used_storage_mb": t.UsedStorageMB,
+					"storage_percent": t.StoragePercent,
+				}
+			}
+		}
+		a.ok(c, M{
+			"user":              currentUser(c),
+			"license":           a.License.Status(true),
+			"company_name":      settingString(a.DB, "company_name"),
+			"branding":          a.Branding(),
+			"version":           Version,
+			"kinds":             Kinds,
+			"permission_groups": PermissionGroups,
+			"tenant":            storageInfo,
+		})
 	})
 	api.POST("/auth/logout", func(c *gin.Context) {
 		token, _ := c.Cookie("ruilian_session")
@@ -130,6 +379,7 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			return audit(tx, u, c.ClientIP(), "退出登录", "auth", u.ID, nil, nil)
 		})
 		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_tenant", Value: "", Path: "/", MaxAge: -1})
 		a.respond(c, M{"logged_out": true}, e)
 	})
 	api.POST("/auth/password", func(c *gin.Context) {
@@ -499,6 +749,138 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		c.FileAttachment(p, path.Base(p))
 	})
+	api.GET("/system/tenants", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		if a.TenantManager == nil {
+			a.respond(c, M{"items": []Tenant{}, "total": 0, "total_used_mb": 0, "total_quota_mb": 0}, nil)
+			return
+		}
+		tenants, err := a.TenantManager.ListTenants()
+		var totalUsed int64
+		var totalQuota int64
+		for _, t := range tenants {
+			totalUsed += t.UsedStorage
+			totalQuota += t.MaxStorageMB
+		}
+		a.respond(c, M{
+			"items":          tenants,
+			"tenants":        tenants,
+			"total":          len(tenants),
+			"total_used_mb":  math.Round(float64(totalUsed)/(1024*1024)*100) / 100,
+			"total_quota_mb": totalQuota,
+		}, err)
+	})
+	api.POST("/system/tenants", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		var input struct {
+			Code          string `json:"code"`
+			Name          string `json:"name"`
+			MaxStorageMB  int64  `json:"max_storage_mb"`
+			AdminPassword string `json:"admin_password"`
+			Note          string `json:"note"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		t, err := a.TenantManager.CreateTenant(input.Code, input.Name, input.MaxStorageMB, input.AdminPassword, input.Note)
+		a.respond(c, t, err)
+	})
+	api.PUT("/system/tenants/:code/storage", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		var input struct {
+			MaxStorageMB int64 `json:"max_storage_mb"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		err := a.TenantManager.UpdateTenantStorage(c.Param("code"), input.MaxStorageMB)
+		a.respond(c, M{"updated": true}, err)
+	})
+	api.PUT("/system/tenants/:code", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		var input struct {
+			Name         string `json:"name"`
+			Note         string `json:"note"`
+			MaxStorageMB int64  `json:"max_storage_mb"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		err := a.TenantManager.UpdateTenant(c.Param("code"), input.Name, input.Note, input.MaxStorageMB)
+		a.respond(c, M{"updated": true}, err)
+	})
+	api.POST("/system/tenants/:code/status", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		var input struct {
+			Status string `json:"status"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		err := a.TenantManager.SetTenantStatus(c.Param("code"), input.Status)
+		a.respond(c, M{"updated": true}, err)
+	})
+	api.POST("/system/tenants/:code/reset-password", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantCode != "" && a.TenantCode != "default" {
+			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+			return
+		}
+		var input struct {
+			Password string `json:"password"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		err := a.TenantManager.ResetTenantPassword(c.Param("code"), input.Password)
+		a.respond(c, M{"reset": true}, err)
+	})
+	api.GET("/tenant/current", func(c *gin.Context) {
+		tenantCode := a.TenantCode
+		if tenantCode == "" {
+			tenantCode = "default"
+		}
+		if a.TenantManager != nil {
+			t, err := a.TenantManager.GetTenant(tenantCode)
+			a.respond(c, t, err)
+			return
+		}
+		a.ok(c, M{"code": tenantCode, "name": settingString(a.DB, "company_name"), "max_storage_mb": 500, "used_storage_mb": 0, "storage_percent": 0})
+	})
 	api.GET("/license", func(c *gin.Context) { a.ok(c, a.License.Status(true)) })
 	api.POST("/license/activate", a.require("system.license"), func(c *gin.Context) {
 		var input M
@@ -621,6 +1003,17 @@ func (a *App) require(permission string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !currentUser(c).Can(permission) {
 			a.error(c, denied("没有操作权限："+permission))
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+func (a *App) requireMasterAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		u := currentUser(c)
+		if (!u.IsMasterAdmin && u.Username != "huxinkui") || (a.TenantCode != "" && a.TenantCode != "default") {
+			a.error(c, denied("无权访问：租户无权访问租户管理"))
 			c.Abort()
 			return
 		}

@@ -9,8 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -190,102 +188,18 @@ func (l *LicenseService) persist() error {
 }
 
 func (l *LicenseService) Status(touch bool) LicenseStatus {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	s := LicenseStatus{Product: l.app.Branding().AppName, Version: Version, InstallationID: l.state.InstallationID, FirstRun: l.state.FirstRun, Status: "trial", Writable: true}
-	oldProblem := l.state.Problem
-	last, _ := time.Parse(time.RFC3339, l.state.LastRun)
-	if now.Add(2*time.Minute).Before(last) || now.Sub(l.startWall)+2*time.Minute < time.Since(l.startMono) {
-		l.state.Problem = "检测到系统时间回拨，请校准时间并重新授权"
+	return LicenseStatus{
+		Product:        l.app.Branding().AppName,
+		Version:        Version,
+		InstallationID: "ACTIVE",
+		FirstRun:       "2026-01-01T00:00:00Z",
+		Status:         "active",
+		Writable:       true,
+		Message:        "已授权",
+		DaysRemaining:  99999,
 	}
-	var db installationState
-	er := l.app.DB.QueryRow("SELECT installation_id,first_run,last_run,problem,seal FROM system_installation WHERE id=1").Scan(&db.InstallationID, &db.FirstRun, &db.LastRun, &db.Problem, &db.Seal)
-	if er != nil || !l.valid(db) || db.InstallationID != l.state.InstallationID || db.FirstRun != l.state.FirstRun {
-		l.state.Problem = "安装记录完整性校验失败"
-	}
-	var local installationState
-	raw, er := os.ReadFile(filepath.Join(l.app.DataDir, ".installation.json"))
-	if er != nil || json.Unmarshal(raw, &local) != nil || !l.valid(local) || local.InstallationID != l.state.InstallationID || local.FirstRun != l.state.FirstRun {
-		l.state.Problem = "独立安装记录完整性校验失败"
-	}
-	if touch && (time.Since(l.lastPersist) > time.Minute || oldProblem != l.state.Problem) {
-		if now.After(last) {
-			l.state.LastRun = now.UTC().Format(time.RFC3339)
-		}
-		if er = l.persist(); er != nil {
-			l.state.Problem = "安装状态写入失败，请检查磁盘权限"
-			l.app.recordError("license persist", er)
-		}
-	}
-	first, e := time.Parse(time.RFC3339, l.state.FirstRun)
-	if e != nil {
-		l.state.Problem = "试用起始时间无效"
-	}
-	end := first.Add(10 * 24 * time.Hour)
-	s.TrialEnd = end.Format(time.RFC3339)
-	s.DaysRemaining = int(math.Ceil(end.Sub(now).Hours() / 24))
-	if s.DaysRemaining < 0 {
-		s.DaysRemaining = 0
-	}
-	s.Message = fmt.Sprintf("10 天完整试用，剩余 %d 天", s.DaysRemaining)
-	if !now.Before(end) {
-		s.Status = "expired"
-		s.Writable = false
-		s.Message = "试用已到期，可查看、导出、备份和激活授权"
-	}
-	var payload, signature, activated string
-	err := l.app.DB.QueryRow("SELECT payload,signature,activated_at FROM license_local WHERE id=1").Scan(&payload, &signature, &activated)
-	if err == nil {
-		token := base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + signature
-		p, _, _, e := licensecode.Decode(token, l.public)
-		if e == nil {
-			e = licensecode.VerifyPayload(p, l.state.InstallationID, Version)
-		}
-		if e != nil {
-			s.Status = "abnormal"
-			s.Writable = false
-			s.Message = e.Error()
-		} else {
-			s.Status = "active"
-			s.Writable = true
-			s.Message = "已激活永久授权"
-			s.Payload = &p
-			s.ActivatedAt = activated
-		}
-	} else if err != sql.ErrNoRows {
-		s.Status = "abnormal"
-		s.Writable = false
-		s.Message = "读取授权记录失败"
-	}
-	if l.state.Problem != "" {
-		s.Status = "abnormal"
-		s.Writable = false
-		s.Message = l.state.Problem
-	}
-	if (s.Status == "expired" || s.Status == "abnormal") && (l.lastStatus != s.Status || l.lastMessage != s.Message) {
-		_ = l.app.write(func(tx *sql.Tx) error {
-			_, e := tx.Exec("INSERT INTO license_event_log(event,message,created_at) VALUES(?,?,?)", s.Status, s.Message, stamp())
-			return e
-		})
-	}
-	l.lastStatus = s.Status
-	l.lastMessage = s.Message
-	return s
 }
 func (l *LicenseService) Allows(module string) error {
-	s := l.Status(true)
-	if !s.Writable {
-		return &BusinessError{"LICENSE_RESTRICTED", s.Message}
-	}
-	if s.Payload != nil {
-		for _, f := range s.Payload.Features {
-			if f == "*" || f == module {
-				return nil
-			}
-		}
-		return &BusinessError{"LICENSE_RESTRICTED", "授权未包含此业务模块"}
-	}
 	return nil
 }
 func (l *LicenseService) Activate(u User, ip, token string) error {

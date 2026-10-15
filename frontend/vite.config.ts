@@ -9,5 +9,14 @@ export default defineConfig({
     chunkSizeWarningLimit: 1600,
     rollupOptions: { output: { manualChunks: { charts: ['echarts'], ui: ['element-plus', '@element-plus/icons-vue'] } } }
   },
-  server: { proxy: { '/api': 'http://127.0.0.1:17888' } }
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:3001',
+        changeOrigin: true
+      }
+    }
+  }
 })

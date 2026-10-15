@@ -20,20 +20,20 @@ func TestDefaultAdminPasswordChangeAndRestartInitialization(t *testing.T) {
 	if e = a.EnsureDefaultAccount(); e != nil {
 		t.Fatal(e)
 	}
-	_, u, e := a.Login("admin", "admin", "test")
-	if e != nil || u.Username != "admin" {
+	_, u, e := a.Login("huxinkui", DefaultAdminPassword, "test")
+	if e != nil || u.Username != "huxinkui" {
 		t.Fatalf("default login: %v", e)
 	}
-	if e = a.ChangePassword(u, "test", "admin", "Changed-2026"); e != nil {
+	if e = a.ChangePassword(u, "test", DefaultAdminPassword, "Changed-2026"); e != nil {
 		t.Fatal(e)
 	}
 	if e = a.EnsureDefaultAccount(); e != nil {
 		t.Fatal(e)
 	}
-	if _, _, e = a.Login("admin", "admin", "test"); e == nil {
+	if _, _, e = a.Login("huxinkui", DefaultAdminPassword, "test"); e == nil {
 		t.Fatal("startup reset a changed password")
 	}
-	if _, _, e = a.Login("admin", "Changed-2026", "test"); e != nil {
+	if _, _, e = a.Login("huxinkui", "Changed-2026", "test"); e != nil {
 		t.Fatal(e)
 	}
 	var users int
