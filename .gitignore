@@ -13,3 +13,13 @@
 *.db-wal
 /.tools/
 /server
+__pycache__/
+*.py[cod]
+*$py.class
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.swp
+*~
