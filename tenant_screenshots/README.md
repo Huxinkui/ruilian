@@ -2,6 +2,8 @@
 
 本目录（`tenant_screenshots/`）包含了租户端全部功能模块的高清界面截图与交互弹窗，专为**设计与研发原生安卓移动端（Android App）及工业 PDA 客户端**提供完整的页面参照、功能清单与接口映射标准。
 
+> 📘 **详尽开发白皮书已生成**：请参阅完整技术文档 [**docs/tenant_pages_and_api_guide.md**](../docs/tenant_pages_and_api_guide.md)，包含详细的页面字段字典、数据模型、状态机转换流、全量 REST API 请求参数与响应 JSON 报文示例、以及 Jetpack Compose / 工业 PDA 扫码 / 蓝牙热敏打印机集成建议。
+
 ---
 
 ## 目录结构索引
