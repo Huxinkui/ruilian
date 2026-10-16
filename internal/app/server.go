@@ -22,6 +22,103 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func isReadOnlyMethod(method string) bool {
+	return method == "GET" || method == "HEAD" || method == "OPTIONS"
+}
+
+func (a *App) extractUser(c *gin.Context) (User, bool) {
+	if u, exists := c.Get("user"); exists {
+		if user, ok := u.(User); ok {
+			return user, true
+		}
+	}
+	token := c.GetHeader("X-Session-Token")
+	if token == "" {
+		authHeader := c.GetHeader("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+	if token == "" {
+		impToken := c.GetHeader("X-Impersonate-Token")
+		if impToken != "" {
+			token = impToken
+		}
+	}
+	if token == "" {
+		if cookie, err := c.Cookie("ruilian_impersonate_token"); err == nil && cookie != "" {
+			token = cookie
+		}
+	}
+	if token == "" {
+		if cookie, err := c.Cookie("ruilian_session"); err == nil && cookie != "" {
+			token = cookie
+		}
+	}
+	if len(token) != 64 {
+		return User{}, false
+	}
+
+	// 1. 优先校验超级管理员跨空间穿透巡检令牌 (Impersonation Token)
+	if a.TenantManager != nil {
+		if sess := a.TenantManager.GetImpersonation(token); sess != nil {
+			var localID int64
+			_ = a.DB.QueryRow("SELECT id FROM users WHERE active=1 ORDER BY id ASC LIMIT 1").Scan(&localID)
+			return User{
+				ID:              localID,
+				Username:        "huxinkui (平台管理员代维)",
+				Name:            "超级管理员 (代维)",
+				RoleID:          1,
+				RoleName:        "超级管理员",
+				Permissions:     []string{"*"},
+				IsMasterAdmin:   true,
+				TenantCode:      sess.TargetTenant,
+				IsImpersonating: true,
+			}, true
+		}
+	}
+
+	// 2. 检查会话是否归属于特定子租户空间
+	if a.TenantManager != nil {
+		targetTenant := a.TenantManager.GetTenantForSession(token)
+		if targetTenant == "" {
+			if cookie, err := c.Cookie("ruilian_tenant"); err == nil && cookie != "" {
+				targetTenant = cookie
+			}
+		}
+		if targetTenant == "" || targetTenant == "default" {
+			if headerTenant := strings.TrimSpace(c.GetHeader("X-Tenant-Code")); headerTenant != "" && headerTenant != "default" {
+				targetTenant = headerTenant
+			}
+		}
+		if targetTenant != "" && targetTenant != "default" && targetTenant != a.TenantCode {
+			subApp, err := a.TenantManager.GetTenantApp(targetTenant)
+			if err == nil && subApp != nil {
+				u, errAuth := subApp.Authenticate(token)
+				if errAuth == nil {
+					u.TenantCode = targetTenant
+					return u, true
+				}
+			}
+		}
+	}
+
+	// 3. 校验本地主空间会话
+	u, err := a.Authenticate(token)
+	if err == nil {
+		return u, true
+	}
+
+	// 4. 若主空间未命中且管理器可用，检查所有租户活跃实例
+	if a.TenantManager != nil {
+		if uSub, ok := a.TenantManager.AuthenticateAnyTenant(token); ok {
+			return uSub, true
+		}
+	}
+
+	return User{}, false
+}
+
 func (a *App) Router(assets fs.FS) *gin.Engine {
 	if a.TenantManager == nil && (a.TenantCode == "" || a.TenantCode == "default") {
 		tm, err := NewTenantManager(a, a.DataDir, a.PublicKey, a.Logger, assets)
@@ -48,7 +145,7 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
-			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Ruilian-Desktop-Token, Origin, Accept")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Ruilian-Desktop-Token, Origin, Accept, X-Tenant-Code, X-Device-Id, X-Device-Model, X-Platform, X-App-Version, X-App-Build, X-Session-Token, X-Impersonate-Token, X-Impersonate-Mode")
 		}
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -56,7 +153,13 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.Header("Cache-Control", "no-store")
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+			if c.Request.URL.Path == "/api/mobile/version/publish" {
+				c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 100<<20)
+			} else if c.Request.URL.Path == "/api/mobile/upload" {
+				c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 15<<20)
+			} else {
+				c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+			}
 			if c.Request.Method != "GET" && c.Request.Method != "HEAD" {
 				if origin != "" {
 					parsed, e := url.Parse(origin)
@@ -79,7 +182,9 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 						return
 					}
 				}
-				if !strings.HasPrefix(c.ContentType(), "application/json") {
+				isMultipart := strings.HasPrefix(c.ContentType(), "multipart/form-data") &&
+					(c.Request.URL.Path == "/api/mobile/upload" || c.Request.URL.Path == "/api/mobile/version/publish")
+				if !isMultipart && !strings.HasPrefix(c.ContentType(), "application/json") {
 					a.error(c, fail("请求须使用 application/json"))
 					c.Abort()
 					return
@@ -93,37 +198,143 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			c.Next()
 			return
 		}
-		if strings.HasPrefix(c.Request.URL.Path, "/api/system/tenants") ||
-			strings.HasPrefix(c.Request.URL.Path, "/api/auth/login") ||
-			strings.HasPrefix(c.Request.URL.Path, "/api/auth/captcha") ||
-			!strings.HasPrefix(c.Request.URL.Path, "/api/") {
+		path := c.Request.URL.Path
+		if !strings.HasPrefix(path, "/api/") ||
+			path == "/api/health" ||
+			path == "/api/auth/captcha" ||
+			path == "/api/auth/login" ||
+			path == "/api/mobile/version/check" ||
+			path == "/api/mobile/version/download" ||
+			strings.HasPrefix(path, "/api/mobile/uploads/") ||
+			strings.HasPrefix(path, "/api/system/tenants") {
 			c.Next()
 			return
 		}
-		tenantCode := strings.TrimSpace(c.GetHeader("X-Tenant-Code"))
-		if tenantCode == "" {
-			if cookie, err := c.Cookie("ruilian_tenant"); err == nil {
-				tenantCode = strings.TrimSpace(cookie)
+
+		// 1. 租户标识提取 (Header > Impersonation Token > Cookie > Query)
+		reqTenant := strings.TrimSpace(c.GetHeader("X-Tenant-Code"))
+		impToken := strings.TrimSpace(c.GetHeader("X-Impersonate-Token"))
+		if impToken == "" {
+			if cookie, err := c.Cookie("ruilian_impersonate_token"); err == nil {
+				impToken = strings.TrimSpace(cookie)
 			}
 		}
-		if tenantCode == "" {
-			tenantCode = strings.TrimSpace(c.Query("tenant"))
+		if reqTenant == "" && impToken != "" {
+			if sess := a.TenantManager.GetImpersonation(impToken); sess != nil {
+				reqTenant = sess.TargetTenant
+			}
 		}
-		if tenantCode == "" {
-			tenantCode = "default"
+		if reqTenant == "" {
+			if cookie, err := c.Cookie("ruilian_tenant"); err == nil {
+				reqTenant = strings.TrimSpace(cookie)
+			}
 		}
-		if tenantCode != "default" && tenantCode != a.TenantCode {
-			if c.Request.Method != "GET" && c.Request.Method != "HEAD" && c.Request.Method != "OPTIONS" {
-				if err := a.TenantManager.CheckStorageQuota(tenantCode); err != nil {
-					c.JSON(http.StatusForbidden, M{"ok": false, "error": M{"code": "STORAGE_QUOTA_EXCEEDED", "message": err.Error()}})
-					c.Abort()
+		if reqTenant == "" {
+			reqTenant = strings.TrimSpace(c.Query("tenant"))
+		}
+		if reqTenant == "" {
+			reqTenant = "default"
+		}
+		reqTenant = strings.ToLower(reqTenant)
+
+		// 2. 租户合法性与路径穿越防御
+		if reqTenant != "default" && !validTenantCode.MatchString(reqTenant) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, M{
+				"ok": false,
+				"error": M{"code": "INVALID_TENANT_CODE", "message": "非法租户代号格式"},
+			})
+			return
+		}
+
+		// 3. 用户上下文解析、超级管理员跨空间穿透与防横向越权拦截
+		user, hasUser := a.extractUser(c)
+		if hasUser {
+			c.Set("user", user)
+			// 情况 A: 超级管理员 huxinkui 发起跨租户穿透巡检
+			if (user.Username == MasterAdminUsername || user.IsMasterAdmin) && reqTenant != "default" {
+				impMode := strings.ToLower(strings.TrimSpace(c.GetHeader("X-Impersonate-Mode")))
+				if impMode == "" && impToken != "" {
+					if sess := a.TenantManager.GetImpersonation(impToken); sess != nil {
+						impMode = sess.AccessMode
+					}
+				}
+				if impMode == "" {
+					impMode = "readonly" // 默认安全只读巡检模式
+				}
+				if impMode != "readwrite" && !isReadOnlyMethod(c.Request.Method) {
+					c.AbortWithStatusJSON(http.StatusForbidden, M{
+						"ok": false,
+						"error": M{
+							"code":    "IMPERSONATION_READONLY_GUARD",
+							"message": "当前处于超级管理员只读巡检模式，已拦截写操作以保护租户现场数据",
+						},
+					})
 					return
 				}
+				c.Set("is_impersonating", true)
+				c.Set("impersonated_by", MasterAdminUsername)
+				c.Set("impersonation_mode", impMode)
+				if impToken != "" {
+					a.TenantManager.RecordImpersonationAction(impToken)
+				}
+			} else if user.TenantCode != "" && user.TenantCode != reqTenant {
+				// 情况 B: 普通租户试图跨空间访问其他租户或 default 主空间 -> 严厉阻断横向越权！
+				c.AbortWithStatusJSON(http.StatusForbidden, M{
+					"ok": false,
+					"error": M{
+						"code":    "TENANT_ISOLATION_VIOLATION",
+						"message": "安全拦截：禁止跨租户空间访问数据！",
+					},
+				})
+				return
 			}
-			handler, err := a.TenantManager.GetTenantHandler(tenantCode)
+		}
+
+		// 4. 加载目标租户物理沙箱实例
+		inst, err := a.TenantManager.GetOrOpenTenant(reqTenant)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, M{
+				"ok": false,
+				"error": M{"code": "TENANT_ERROR", "message": err.Error()},
+			})
+			return
+		}
+		if inst.Status == "suspended" {
+			c.AbortWithStatusJSON(http.StatusLocked, M{
+				"ok": false,
+				"error": M{"code": "TENANT_UNAVAILABLE", "message": "租户空间不存在或已被管理员冻结"},
+			})
+			return
+		}
+
+		// 5. 存储配额与滞回防抖检查（含逃生白名单通道）
+		isExempt := hasUser && (user.Username == MasterAdminUsername || user.IsMasterAdmin)
+		if errQuota := a.TenantManager.CheckStorageQuota(reqTenant, c.Request.Method, c.Request.URL.Path, isExempt); errQuota != nil {
+			c.AbortWithStatusJSON(http.StatusForbidden, M{
+				"ok": false,
+				"error": M{"code": "STORAGE_QUOTA_EXCEEDED", "message": errQuota.Error()},
+			})
+			return
+		}
+
+		// 软预警线 (85% 水线) 响应头提示
+		maxBytes := inst.MaxQuotaBytes.Load()
+		if maxBytes > 0 {
+			usedBytes := inst.UsedBytes.Load()
+			pct := (float64(usedBytes) / float64(maxBytes)) * 100
+			if pct >= 85 {
+				c.Header("X-Quota-Warning", fmt.Sprintf("%.1f%%", pct))
+			}
+		}
+
+		// 6. 转发给子租户独立 Handler
+		if reqTenant != "default" && reqTenant != a.TenantCode {
+			handler, err := a.TenantManager.GetTenantHandler(reqTenant)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, M{"ok": false, "error": M{"code": "TENANT_ERROR", "message": err.Error()}})
-				c.Abort()
+				c.AbortWithStatusJSON(http.StatusBadRequest, M{
+					"ok": false,
+					"error": M{"code": "TENANT_ERROR", "message": err.Error()},
+				})
 				return
 			}
 			handler.ServeHTTP(c.Writer, c.Request)
@@ -299,7 +510,20 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			loginUsername = targetTenant
 		}
 
-		token, u, e := targetApp.Login(loginUsername, loginPassword, clientIP)
+		clientType := strings.ToLower(strings.TrimSpace(str(input, "client_type")))
+		if clientType == "" {
+			clientType = strings.ToLower(strings.TrimSpace(c.GetHeader("X-Platform")))
+		}
+		platform := strings.TrimSpace(str(input, "platform"))
+		if platform == "" {
+			platform = c.GetHeader("X-Platform")
+		}
+		deviceId := strings.TrimSpace(str(input, "device_id"))
+		if deviceId == "" {
+			deviceId = c.GetHeader("X-Device-Id")
+		}
+
+		token, u, e := targetApp.Login(loginUsername, loginPassword, clientIP, clientType, platform, deviceId)
 		if e != nil {
 			lockedNow, remaining, _, remAttempts := a.IPLimiter.RecordFailure(clientIP)
 			if lockedNow {
@@ -312,29 +536,32 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 
 		// 登录成功，清除该 IP 的失败记录
 		a.IPLimiter.RecordSuccess(clientIP)
-		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: 12 * 60 * 60})
-		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_tenant", Value: targetTenant, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: 12 * 60 * 60})
-		a.ok(c, M{"token": token, "user": u, "tenant_code": targetTenant, "license": a.License.Status(true)})
+		if a.TenantManager != nil {
+			a.TenantManager.RegisterSession(token, targetTenant)
+		}
+
+		isMobile := clientType == "mobile" || clientType == "android" || clientType == "ios" || clientType == "pda" || clientType == "app"
+		cookieMaxAge := 12 * 60 * 60
+		expiresIn := int64(12 * 3600)
+		if isMobile {
+			cookieMaxAge = 30 * 24 * 60 * 60
+			expiresIn = 30 * 24 * 3600
+		}
+		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: cookieMaxAge})
+		http.SetCookie(c.Writer, &http.Cookie{Name: "ruilian_tenant", Value: targetTenant, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, Secure: c.Request.TLS != nil, MaxAge: cookieMaxAge})
+		a.ok(c, M{
+			"token":       token,
+			"user":        u,
+			"tenant_code": targetTenant,
+			"license":     a.License.Status(true),
+			"expires_in":  expiresIn,
+			"client_type": clientType,
+		})
 	})
 	api := r.Group("/api", func(c *gin.Context) {
-		token := c.GetHeader("X-Session-Token")
-		if token == "" {
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-		if token == "" {
-			token, _ = c.Cookie("ruilian_session")
-		}
-		if token == "" {
+		u, ok := a.extractUser(c)
+		if !ok {
 			c.JSON(401, M{"ok": false, "error": M{"code": "UNAUTHENTICATED", "message": "请先登录"}})
-			c.Abort()
-			return
-		}
-		u, e := a.Authenticate(token)
-		if e != nil {
-			c.JSON(401, M{"ok": false, "error": M{"code": "UNAUTHENTICATED", "message": "登录已过期，请重新登录"}})
 			c.Abort()
 			return
 		}
@@ -371,6 +598,9 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 	})
 	api.POST("/auth/logout", func(c *gin.Context) {
 		token, _ := c.Cookie("ruilian_session")
+		if a.TenantManager != nil {
+			a.TenantManager.UnregisterSession(token)
+		}
 		u := currentUser(c)
 		e := a.write(func(tx *sql.Tx) error {
 			if _, e := tx.Exec("DELETE FROM sessions WHERE token_hash=?", tokenHash(token)); e != nil {
@@ -773,6 +1003,7 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			"total_quota_mb": totalQuota,
 		}, err)
 	})
+
 	api.POST("/system/tenants", a.requireMasterAdmin(), func(c *gin.Context) {
 		if a.TenantCode != "" && a.TenantCode != "default" {
 			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
@@ -784,6 +1015,8 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			MaxStorageMB  int64  `json:"max_storage_mb"`
 			AdminPassword string `json:"admin_password"`
 			Note          string `json:"note"`
+			ExpireAt      string `json:"expire_at"`
+			MaxUsers      int    `json:"max_users"`
 		}
 		if !a.bind(c, &input) {
 			return
@@ -792,14 +1025,37 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			a.error(c, fail("多租户管理器未启用"))
 			return
 		}
-		t, err := a.TenantManager.CreateTenant(input.Code, input.Name, input.MaxStorageMB, input.AdminPassword, input.Note)
+		t, err := a.TenantManager.CreateTenant(input.Code, input.Name, input.MaxStorageMB, input.AdminPassword, input.Note, input.ExpireAt, input.MaxUsers)
 		a.respond(c, t, err)
 	})
-	api.PUT("/system/tenants/:code/storage", a.requireMasterAdmin(), func(c *gin.Context) {
-		if a.TenantCode != "" && a.TenantCode != "default" {
-			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+
+	// 查看租户后台深度详情（穿透读取业务KPI、表行数分布、WAL体积、活跃会话与审计日志）
+	api.GET("/system/tenants/:code/inspect", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
 			return
 		}
+		res, err := a.TenantManager.InspectTenant(c.Param("code"))
+		a.respond(c, res, err)
+	})
+
+	// 生成超级管理员穿透巡检令牌
+	api.POST("/system/tenants/:code/impersonate", a.requireMasterAdmin(), func(c *gin.Context) {
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		var input struct {
+			Mode string `json:"mode"`
+		}
+		_ = a.bind(c, &input)
+		u := currentUser(c)
+		sess, err := a.TenantManager.CreateImpersonation(u.Username, c.Param("code"), input.Mode, c.ClientIP())
+		a.respond(c, sess, err)
+	})
+
+	// 动态调整存储配额
+	api.PUT("/system/tenants/:code/quota", a.requireMasterAdmin(), func(c *gin.Context) {
 		var input struct {
 			MaxStorageMB int64 `json:"max_storage_mb"`
 		}
@@ -810,14 +1066,26 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 			a.error(c, fail("多租户管理器未启用"))
 			return
 		}
-		err := a.TenantManager.UpdateTenantStorage(c.Param("code"), input.MaxStorageMB)
+		err := a.TenantManager.UpdateTenantQuota(c.Param("code"), input.MaxStorageMB)
 		a.respond(c, M{"updated": true}, err)
 	})
-	api.PUT("/system/tenants/:code", a.requireMasterAdmin(), func(c *gin.Context) {
-		if a.TenantCode != "" && a.TenantCode != "default" {
-			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
+
+	api.PUT("/system/tenants/:code/storage", a.requireMasterAdmin(), func(c *gin.Context) {
+		var input struct {
+			MaxStorageMB int64 `json:"max_storage_mb"`
+		}
+		if !a.bind(c, &input) {
 			return
 		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		err := a.TenantManager.UpdateTenantQuota(c.Param("code"), input.MaxStorageMB)
+		a.respond(c, M{"updated": true}, err)
+	})
+
+	api.PUT("/system/tenants/:code", a.requireMasterAdmin(), func(c *gin.Context) {
 		var input struct {
 			Name         string `json:"name"`
 			Note         string `json:"note"`
@@ -833,11 +1101,8 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		err := a.TenantManager.UpdateTenant(c.Param("code"), input.Name, input.Note, input.MaxStorageMB)
 		a.respond(c, M{"updated": true}, err)
 	})
-	api.POST("/system/tenants/:code/status", a.requireMasterAdmin(), func(c *gin.Context) {
-		if a.TenantCode != "" && a.TenantCode != "default" {
-			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
-			return
-		}
+
+	tenantStatusHandler := func(c *gin.Context) {
 		var input struct {
 			Status string `json:"status"`
 		}
@@ -850,12 +1115,11 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		err := a.TenantManager.SetTenantStatus(c.Param("code"), input.Status)
 		a.respond(c, M{"updated": true}, err)
-	})
-	api.POST("/system/tenants/:code/reset-password", a.requireMasterAdmin(), func(c *gin.Context) {
-		if a.TenantCode != "" && a.TenantCode != "default" {
-			a.error(c, fail("仅系统主空间超级管理员可管理租户"))
-			return
-		}
+	}
+	api.PUT("/system/tenants/:code/status", a.requireMasterAdmin(), tenantStatusHandler)
+	api.POST("/system/tenants/:code/status", a.requireMasterAdmin(), tenantStatusHandler)
+
+	tenantPwdHandler := func(c *gin.Context) {
 		var input struct {
 			Password string `json:"password"`
 		}
@@ -868,6 +1132,43 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		}
 		err := a.TenantManager.ResetTenantPassword(c.Param("code"), input.Password)
 		a.respond(c, M{"reset": true}, err)
+	}
+	api.POST("/system/tenants/:code/reset-pwd", a.requireMasterAdmin(), tenantPwdHandler)
+	api.POST("/system/tenants/:code/reset-password", a.requireMasterAdmin(), tenantPwdHandler)
+
+	// 空间碎片整理与快照备份
+	api.POST("/system/tenants/:code/maintenance", a.requireMasterAdmin(), func(c *gin.Context) {
+		var input struct {
+			Action string `json:"action"` // "checkpoint" 或 "vacuum"
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		res, err := a.TenantManager.Maintenance(c.Param("code"), input.Action)
+		a.respond(c, res, err)
+	})
+
+	// 租户空间归档与销毁 / 清理已归档租户元数据
+	api.DELETE("/system/tenants/:code", a.requireMasterAdmin(), func(c *gin.Context) {
+		var input struct {
+			ConfirmPassword string `json:"confirm_password"`
+			Purge           bool   `json:"purge"`
+		}
+		if !a.bind(c, &input) {
+			return
+		}
+		if a.TenantManager == nil {
+			a.error(c, fail("多租户管理器未启用"))
+			return
+		}
+		u := currentUser(c)
+		purge := input.Purge || c.Query("purge") == "true"
+		res, err := a.TenantManager.ArchiveTenant(c.Param("code"), input.ConfirmPassword, u, c.ClientIP(), purge)
+		a.respond(c, res, err)
 	})
 	api.GET("/tenant/current", func(c *gin.Context) {
 		tenantCode := a.TenantCode
@@ -924,14 +1225,10 @@ func (a *App) Router(assets fs.FS) *gin.Engine {
 		a.ok(c, out)
 	})
 	api.GET("/export", func(c *gin.Context) { a.export(c) })
-	api.POST("/system/shutdown", a.require("system.settings"), func(c *gin.Context) {
-		u := currentUser(c)
-		_ = a.write(func(tx *sql.Tx) error { return audit(tx, u, c.ClientIP(), "停止本机服务", "system", 0, nil, nil) })
-		a.ok(c, M{"stopping": true})
-		if a.Stop != nil {
-			go func() { time.Sleep(300 * time.Millisecond); a.Stop() }()
-		}
-	})
+
+	// 注册移动端 APK 专属及适配路由组
+	a.RegisterMobileRoutes(r, api)
+
 	r.NoRoute(func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.JSON(404, M{"ok": false, "error": M{"code": "NOT_FOUND", "message": "接口不存在"}})
@@ -1012,9 +1309,18 @@ func (a *App) require(permission string) gin.HandlerFunc {
 func (a *App) requireMasterAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		u := currentUser(c)
-		if (!u.IsMasterAdmin && u.Username != "huxinkui") || (a.TenantCode != "" && a.TenantCode != "default") {
-			a.error(c, denied("无权访问：租户无权访问租户管理"))
-			c.Abort()
+		tenantCode := a.TenantCode
+		if tenantCode == "" {
+			tenantCode = "default"
+		}
+		if (u.Username != MasterAdminUsername && !u.IsMasterAdmin) || tenantCode != "default" {
+			c.AbortWithStatusJSON(http.StatusForbidden, M{
+				"ok": false,
+				"error": M{
+					"code":    "FORBIDDEN_MASTER_ADMIN_ONLY",
+					"message": "权限越界：仅平台专属超级管理员 (huxinkui) 可访问多租户总控中枢",
+				},
+			})
 			return
 		}
 		c.Next()

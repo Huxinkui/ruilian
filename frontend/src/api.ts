@@ -16,6 +16,28 @@ export function setToken(token: string) {
   else localStorage.removeItem('ruilian_token')
 }
 
+export function getImpersonateToken(): string {
+  return localStorage.getItem('ruilian_impersonate_token') || ''
+}
+export function setImpersonateToken(token: string) {
+  if (token) localStorage.setItem('ruilian_impersonate_token', token)
+  else localStorage.removeItem('ruilian_impersonate_token')
+}
+export function getImpersonateMode(): string {
+  return localStorage.getItem('ruilian_impersonate_mode') || 'readonly'
+}
+export function setImpersonateMode(mode: string) {
+  if (mode) localStorage.setItem('ruilian_impersonate_mode', mode)
+  else localStorage.removeItem('ruilian_impersonate_mode')
+}
+export function getImpersonatedTenant(): string {
+  return localStorage.getItem('ruilian_impersonated_tenant') || ''
+}
+export function setImpersonatedTenant(tenant: string) {
+  if (tenant) localStorage.setItem('ruilian_impersonated_tenant', tenant)
+  else localStorage.removeItem('ruilian_impersonated_tenant')
+}
+
 export function safeUUID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     try { return crypto.randomUUID() } catch {}
@@ -29,6 +51,8 @@ export function safeUUID(): string {
 
 export async function api<T = any>(path: string, method = 'GET', body?: any, quiet = false): Promise<T> {
   const token = getToken()
+  const impToken = getImpersonateToken()
+  const impMode = getImpersonateMode()
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Tenant-Code': getTenantCode()
@@ -36,6 +60,10 @@ export async function api<T = any>(path: string, method = 'GET', body?: any, qui
   if (token) {
     headers['Authorization'] = 'Bearer ' + token
     headers['X-Session-Token'] = token
+  }
+  if (impToken) {
+    headers['X-Impersonate-Token'] = impToken
+    headers['X-Impersonate-Mode'] = impMode
   }
   if (method !== 'GET') headers['Idempotency-Key'] = safeUUID()
   const options: RequestInit = { method, headers, credentials: 'include', body: method === 'GET' ? undefined : JSON.stringify(body ?? {}) }
@@ -47,6 +75,10 @@ export async function api<T = any>(path: string, method = 'GET', body?: any, qui
         await new Promise(resolve => setTimeout(resolve, 600))
         response = await fetch('/api' + path, options)
       } else throw error
+    }
+    const quotaWarning = response.headers.get('X-Quota-Warning')
+    if (quotaWarning && !quiet) {
+      ElMessage.warning({ message: `租户存储空间占用率已达 ${quotaWarning}，已接近配额上限，请注意扩容或清理单据！`, duration: 5000, grouping: true })
     }
     const result = await response.json()
     if (!result.ok) {
@@ -71,10 +103,16 @@ export function query(values: Record<string, any>) {
 export async function download(path: string, filename?: string) {
   try {
     const token = getToken()
+    const impToken = getImpersonateToken()
+    const impMode = getImpersonateMode()
     const headers: Record<string, string> = { 'X-Tenant-Code': getTenantCode() }
     if (token) {
       headers['Authorization'] = 'Bearer ' + token
       headers['X-Session-Token'] = token
+    }
+    if (impToken) {
+      headers['X-Impersonate-Token'] = impToken
+      headers['X-Impersonate-Mode'] = impMode
     }
     const response = await fetch('/api' + path, { credentials: 'include', headers })
     if (!response.ok) { const result = await response.json(); throw new Error(result.error?.message || '导出失败') }

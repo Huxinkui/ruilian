@@ -10,6 +10,11 @@ export const useApp = defineStore('app', () => {
   const kinds = ref<any[]>([]), permissionGroups = ref<Record<string, string[]>>({}), tick = ref(0), warningCount = ref(0)
   const editor = ref<{ visible: boolean; id: number; kind: string; preset: any }>({ visible: false, id: 0, kind: '', preset: null })
   const tenantList = ref<any[]>([])
+  const impersonationToken = ref(localStorage.getItem('ruilian_impersonate_token') || '')
+  const impersonationMode = ref(localStorage.getItem('ruilian_impersonate_mode') || 'readonly')
+  const impersonatedTenant = ref(localStorage.getItem('ruilian_impersonated_tenant') || '')
+  const isImpersonating = computed(() => !!impersonationToken.value && !!impersonatedTenant.value)
+
   const can = (permission: string) => !!user.value && (user.value.permissions.includes('*') || user.value.permissions.includes(permission))
   const isMasterAdmin = computed(() => !!user.value && (user.value.username === 'huxinkui' || !!user.value.is_master_admin) && (tenant.value?.code === 'default' || !tenant.value?.code))
   const amountVisible = computed(() => can('amount.view')), costVisible = computed(() => can('cost.view'))
@@ -43,7 +48,7 @@ export const useApp = defineStore('app', () => {
     kinds.value = result.kinds; permissionGroups.value = result.permission_groups
   }
   async function loadTenantList() {
-    if (user.value && (user.value.is_master_admin || user.value.username === 'huxinkui')) {
+    if (user.value && (user.value.is_master_admin || user.value.username === 'huxinkui') && (tenant.value?.code === 'default' || !tenant.value?.code)) {
       try {
         const res = await api('/system/tenants', 'GET', undefined, true)
         tenantList.value = res.items || res.tenants || []
@@ -62,7 +67,32 @@ export const useApp = defineStore('app', () => {
     await loadTenantList()
     changed()
   }
+  function startImpersonation(tenantCode: string, mode: string, token: string) {
+    impersonationToken.value = token
+    impersonationMode.value = mode || 'readonly'
+    impersonatedTenant.value = tenantCode
+    localStorage.setItem('ruilian_impersonate_token', token)
+    localStorage.setItem('ruilian_impersonate_mode', mode || 'readonly')
+    localStorage.setItem('ruilian_impersonated_tenant', tenantCode)
+    localStorage.setItem('ruilian_tenant', tenantCode)
+    document.cookie = `ruilian_impersonate_token=${token}; path=/; max-age=1800; SameSite=Lax`
+    document.cookie = `ruilian_tenant=${tenantCode}; path=/; max-age=1800; SameSite=Lax`
+  }
+  async function exitImpersonation() {
+    impersonationToken.value = ''
+    impersonationMode.value = 'readonly'
+    impersonatedTenant.value = ''
+    localStorage.removeItem('ruilian_impersonate_token')
+    localStorage.removeItem('ruilian_impersonate_mode')
+    localStorage.removeItem('ruilian_impersonated_tenant')
+    localStorage.setItem('ruilian_tenant', 'default')
+    document.cookie = `ruilian_impersonate_token=; path=/; max-age=-1`
+    document.cookie = `ruilian_tenant=default; path=/; max-age=43200; SameSite=Lax`
+    await refreshMe()
+    await loadTenantList()
+    changed()
+  }
   function openDoc(id = 0, kind = '', preset: any = null) { editor.value = { visible: true, id, kind, preset } }
   function changed() { tick.value++ }
-  return { user, license, company, tenant, tenantList, branding, needsSetup, ready, kinds, permissionGroups, tick, warningCount, editor, can, isMasterAdmin, writable, amountVisible, costVisible, bootstrap, refreshMe, loadTenantList, switchTenant, openDoc, changed }
+  return { user, license, company, tenant, tenantList, branding, needsSetup, ready, kinds, permissionGroups, tick, warningCount, editor, isImpersonating, impersonationToken, impersonationMode, impersonatedTenant, can, isMasterAdmin, writable, amountVisible, costVisible, bootstrap, refreshMe, loadTenantList, switchTenant, startImpersonation, exitImpersonation, openDoc, changed }
 })

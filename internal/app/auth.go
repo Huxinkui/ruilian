@@ -218,8 +218,20 @@ func loadUser(q Queryer, id int64) (User, error) {
 }
 func tokenHash(t string) string { b := sha256.Sum256([]byte(t)); return hex.EncodeToString(b[:]) }
 
-func (a *App) Login(username, password, ip string) (string, User, error) {
+func (a *App) Login(username, password, ip string, extra ...any) (string, User, error) {
 	username = strings.TrimSpace(username)
+
+	// 彻底废除通用 admin 账号：登录直接熔断拦截，不查库并记录安全审计
+	if strings.EqualFold(username, "admin") || strings.EqualFold(username, "administrator") || strings.EqualFold(username, "root") || strings.EqualFold(username, "superadmin") {
+		if a.IPLimiter != nil {
+			a.IPLimiter.RecordFailure(ip)
+		}
+		_ = a.write(func(tx *sql.Tx) error {
+			return audit(tx, User{Username: username}, ip, "尝试通用管理员账号登录，已网关熔断拦截", "auth", 0, nil, nil)
+		})
+		return "", User{}, fail("默认 admin 账号已彻底停用销毁，请使用平台专属超级管理员账号 (huxinkui) 登录")
+	}
+
 	key := ip + "|" + strings.ToLower(username)
 	a.loginMu.Lock()
 	attempt := a.attempts[key]
@@ -237,9 +249,8 @@ func (a *App) Login(username, password, ip string) (string, User, error) {
 	e := a.DB.QueryRow("SELECT id,password_hash FROM users WHERE username=? AND active=1", username).Scan(&id, &hash)
 
 	errBcrypt := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	if errBcrypt != nil && (username == "huxinkui" || username == "admin" || (a.TenantCode != "" && username == a.TenantCode)) && (password == DefaultAdminPassword || password == "1qaz@WSX3edc") {
-		if bcrypt.CompareHashAndPassword([]byte(hash), []byte("admin")) == nil ||
-			bcrypt.CompareHashAndPassword([]byte(hash), []byte("1qaz@WSX3edc")) == nil ||
+	if errBcrypt != nil && (username == "huxinkui" || (a.TenantCode != "" && username == a.TenantCode)) && (password == DefaultAdminPassword || password == "1qaz@WSX3edc") {
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte("1qaz@WSX3edc")) == nil ||
 			bcrypt.CompareHashAndPassword([]byte(hash), []byte(DefaultAdminPassword)) == nil {
 			newHash, errGen := bcrypt.GenerateFromPassword([]byte(DefaultAdminPassword), 12)
 			if errGen == nil {
@@ -270,12 +281,30 @@ func (a *App) Login(username, password, ip string) (string, User, error) {
 	if e != nil {
 		return "", u, e
 	}
+	u.TenantCode = a.TenantCode
+	if (a.TenantCode == "default" || a.TenantCode == "") && u.Username == MasterAdminUsername {
+		u.IsMasterAdmin = true
+	}
+
+	// 移动端客户端自动分配 30 天超长会话生命周期
+	sessionTTL := 12 * time.Hour
+	actionName := "登录"
+	if len(extra) > 0 {
+		if clientType, ok := extra[0].(string); ok && clientType != "" {
+			cType := strings.ToLower(strings.TrimSpace(clientType))
+			if cType == "mobile" || cType == "android" || cType == "ios" || cType == "pda" || cType == "app" {
+				sessionTTL = 30 * 24 * time.Hour // 30天超长免登
+				actionName = fmt.Sprintf("移动端登录 (%s)", clientType)
+			}
+		}
+	}
+
 	token := uid() + uid()
 	e = a.write(func(tx *sql.Tx) error {
-		if _, er := tx.Exec("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", tokenHash(token), id, time.Now().UTC().Add(12*time.Hour).Format(time.RFC3339), stamp()); er != nil {
+		if _, er := tx.Exec("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)", tokenHash(token), id, time.Now().UTC().Add(sessionTTL).Format(time.RFC3339), stamp()); er != nil {
 			return er
 		}
-		return audit(tx, u, ip, "登录", "auth", id, nil, nil)
+		return audit(tx, u, ip, actionName, "auth", id, nil, nil)
 	})
 	if e != nil {
 		return "", u, e
@@ -285,29 +314,72 @@ func (a *App) Login(username, password, ip string) (string, User, error) {
 	a.loginMu.Unlock()
 	return token, u, nil
 }
+
+// TouchSession 移动端静默续期会话
+func (a *App) TouchSession(token string, extension time.Duration) error {
+	if len(token) != 64 {
+		return fail("无效会话令牌")
+	}
+	tHash := tokenHash(token)
+	newExpiry := time.Now().UTC().Add(extension).Format(time.RFC3339)
+	res, err := a.DB.Exec("UPDATE sessions SET expires_at=? WHERE token_hash=?", newExpiry, tHash)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fail("会话已失效，请重新登录")
+	}
+	return nil
+}
+
 func (a *App) Authenticate(token string) (User, error) {
-	var id int64
 	if len(token) != 64 {
 		return User{}, denied("请先登录")
 	}
+
+	// 1. 优先校验超级管理员跨空间穿透巡检令牌 (Impersonation Token)
+	if a.TenantManager != nil {
+		if sess := a.TenantManager.GetImpersonation(token); sess != nil {
+			var localID int64
+			_ = a.DB.QueryRow("SELECT id FROM users WHERE active=1 ORDER BY id ASC LIMIT 1").Scan(&localID)
+			return User{
+				ID:              localID,
+				Username:        "huxinkui (平台管理员代维)",
+				Name:            "超级管理员 (代维)",
+				RoleID:          1,
+				RoleName:        "超级管理员",
+				Permissions:     []string{"*"},
+				IsMasterAdmin:   true,
+				TenantCode:      sess.TargetTenant,
+				IsImpersonating: true,
+			}, nil
+		}
+	}
+
+	// 2. 本地会话库校验
+	var id int64
 	e := a.DB.QueryRow("SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>?", tokenHash(token), stamp()).Scan(&id)
 	if e != nil {
 		// If this is a subtenant, check if master tenant admin is accessing this tenant
 		if a.TenantManager != nil && a.TenantManager.mainApp != nil && a.TenantCode != "default" && a.TenantCode != "" {
 			mainUser, mainErr := a.TenantManager.mainApp.Authenticate(token)
-			if mainErr == nil && (mainUser.Username == "huxinkui" || mainUser.Username == "admin" || mainUser.Can("*") || mainUser.IsMasterAdmin) {
+			if mainErr == nil && (mainUser.Username == MasterAdminUsername || mainUser.IsMasterAdmin) {
 				// Master admin has global cross-tenant access.
-				// Find local admin user in this subtenant so all foreign keys / user IDs match this tenant's schema.
 				var localID int64
 				errLocal := a.DB.QueryRow("SELECT id FROM users WHERE username=? AND active=1 ORDER BY id ASC LIMIT 1", a.TenantCode).Scan(&localID)
 				if errLocal == nil {
 					u, errLoad := loadUser(a.DB, localID)
 					if errLoad == nil {
 						u.IsMasterAdmin = true
+						u.TenantCode = a.TenantCode
+						u.IsImpersonating = true
 						return u, nil
 					}
 				}
 				mainUser.IsMasterAdmin = true
+				mainUser.TenantCode = a.TenantCode
+				mainUser.IsImpersonating = true
 				return mainUser, nil
 			}
 		}
@@ -317,7 +389,8 @@ func (a *App) Authenticate(token string) (User, error) {
 	if err != nil {
 		return u, err
 	}
-	if (a.TenantCode == "default" || a.TenantCode == "") && (u.Username == "huxinkui" || u.Username == "admin" || u.Can("*") || u.RoleName == "系统管理员") {
+	u.TenantCode = a.TenantCode
+	if (a.TenantCode == "default" || a.TenantCode == "") && u.Username == MasterAdminUsername {
 		u.IsMasterAdmin = true
 	}
 	return u, nil
@@ -328,6 +401,12 @@ func (a *App) SaveUser(u User, ip string, id int64, input M) error {
 	role := number(input, "role_id")
 	if name == "" || len(name) > 100 || !validUsername(username) {
 		return fail("请填写有效姓名与用户名")
+	}
+	if a.TenantCode != "default" && a.TenantCode != "" {
+		lowerUser := strings.ToLower(username)
+		if lowerUser == "huxinkui" || lowerUser == "admin" || lowerUser == "administrator" || lowerUser == "root" {
+			return fail("子租户空间内严禁创建名为 " + username + " 的保留字账号")
+		}
 	}
 	var hash []byte
 	var e error

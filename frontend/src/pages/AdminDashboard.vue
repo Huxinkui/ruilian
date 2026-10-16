@@ -79,6 +79,10 @@ const quotaPresets = [
 ]
 
 async function load() {
+  const isMaster = !!app.user && (app.user.username === 'huxinkui' || app.user.is_master_admin) && (app.tenant?.code === 'default' || !app.tenant?.code)
+  if (!isMaster) {
+    return
+  }
   busy.value = true
   try {
     const res = await api('/system/tenants')
@@ -101,7 +105,8 @@ watch(() => app.tick, load)
 
 // 活跃与告警计算
 const activeCount = computed(() => tenants.value.filter(t => t.status === 'active').length)
-const disabledCount = computed(() => tenants.value.filter(t => t.status === 'disabled').length)
+const disabledCount = computed(() => tenants.value.filter(t => t.status === 'disabled' || t.status === 'suspended').length)
+const archivedCount = computed(() => tenants.value.filter(t => t.status === 'archived').length)
 const warningTenants = computed(() => {
   return tenants.value.filter(t => {
     if (!t.max_storage_mb || t.max_storage_mb <= 0) return false
@@ -161,14 +166,15 @@ const pieOption = computed(() => {
   }
 })
 
-// 跨租户快速监管
+// 跨租户快速监管与安全巡检
 async function handleSwitch(code: string) {
   try {
-    await app.switchTenant(code)
-    ElMessage.success(`已切换至租户空间：${code}`)
+    const res = await api(`/system/tenants/${code}/impersonate`, 'POST', { mode: 'readonly' })
+    app.startImpersonation(res.tenant_code || code, res.access_mode || 'readonly', res.token)
+    ElMessage.success(`已成功签发30分钟临时巡检凭证，进入租户【${code}】只读巡检模式`)
     router.push('/')
   } catch (err: any) {
-    ElMessage.error(err?.message || '跨租户切换失败')
+    ElMessage.error(err?.message || '跨租户巡检失败')
   }
 }
 
@@ -445,8 +451,8 @@ async function handleToggleStatus(t: any) {
 
         <el-table-column label="运行状态" width="100" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.status === 'active' ? 'success' : 'danger'" size="small">
-              {{ row.status === 'active' ? '正常运行' : '已停用' }}
+            <el-tag :type="row.status === 'active' ? 'success' : (row.status === 'archived' ? 'info' : 'danger')" size="small">
+              {{ row.status === 'active' ? '正常运行' : (row.status === 'archived' ? '已归档' : '已停用') }}
             </el-tag>
           </template>
         </el-table-column>
@@ -454,35 +460,40 @@ async function handleToggleStatus(t: any) {
         <el-table-column label="管理操作" width="280" align="right">
           <template #default="{ row }">
             <div class="fleet-actions">
-              <el-button
-                v-if="row.code !== 'default'"
-                size="small"
-                type="primary"
-                plain
-                @click="handleSwitch(row.code)"
-              >
-                跨空间巡检
-              </el-button>
-              <el-button size="small" :icon="Setting" @click="openStorageModal(row)">
-                配额
-              </el-button>
-              <el-button
-                v-if="row.code !== 'default'"
-                size="small"
-                :icon="Key"
-                @click="openPasswordModal(row)"
-              >
-                重置密码
-              </el-button>
-              <el-button
-                v-if="row.code !== 'default'"
-                size="small"
-                :type="row.status === 'active' ? 'danger' : 'success'"
-                link
-                @click="handleToggleStatus(row)"
-              >
-                {{ row.status === 'active' ? '停用' : '启用' }}
-              </el-button>
+              <template v-if="row.status !== 'archived'">
+                <el-button
+                  v-if="row.code !== 'default'"
+                  size="small"
+                  type="primary"
+                  plain
+                  @click="handleSwitch(row.code)"
+                >
+                  跨空间巡检
+                </el-button>
+                <el-button size="small" :icon="Setting" @click="openStorageModal(row)">
+                  配额
+                </el-button>
+                <el-button
+                  v-if="row.code !== 'default'"
+                  size="small"
+                  :icon="Key"
+                  @click="openPasswordModal(row)"
+                >
+                  重置密码
+                </el-button>
+                <el-button
+                  v-if="row.code !== 'default'"
+                  size="small"
+                  :type="row.status === 'active' ? 'danger' : 'success'"
+                  link
+                  @click="handleToggleStatus(row)"
+                >
+                  {{ row.status === 'active' ? '停用' : '启用' }}
+                </el-button>
+              </template>
+              <template v-else>
+                <el-tag size="small" type="info" effect="plain">物理空间已销毁 · 已冷备</el-tag>
+              </template>
             </div>
           </template>
         </el-table-column>

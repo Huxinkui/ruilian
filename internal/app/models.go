@@ -181,6 +181,8 @@ type User struct {
 	DataScope      string   `json:"data_scope"`
 	OrganizationID int64    `json:"organization_id"`
 	IsMasterAdmin  bool     `json:"is_master_admin"`
+	TenantCode     string   `json:"tenant_code"`
+	IsImpersonating bool    `json:"is_impersonating"`
 }
 
 func (u User) Can(p string) bool {
@@ -367,4 +369,95 @@ func notFound(err error) error {
 		return &BusinessError{"NOT_FOUND", "记录不存在或已停用"}
 	}
 	return err
+}
+
+// AppVersion 移动端 APK 安装包版本信息
+type AppVersion struct {
+	ID               int64  `json:"id"`
+	Platform         string `json:"platform"`
+	VersionName      string `json:"version_name"`
+	VersionCode      int    `json:"version_code"`
+	MinSupportedCode int    `json:"min_supported_code"`
+	DownloadURL      string `json:"download_url"`
+	APKSize          int64  `json:"apk_size"`
+	APKSHA256        string `json:"apk_sha256"`
+	ReleaseNotes     string `json:"release_notes"`
+	IsLatest         bool   `json:"is_latest"`
+	PublishedAt      string `json:"published_at"`
+}
+
+// AppVersionCheckResponse 移动端 APK 版本检测返回
+type AppVersionCheckResponse struct {
+	HasUpdate        bool   `json:"has_update"`
+	ForceUpdate      bool   `json:"force_update"`
+	VersionName      string `json:"version_name"`
+	VersionCode      int    `json:"version_code"`
+	MinSupportedCode int    `json:"min_supported_code"`
+	DownloadURL      string `json:"download_url"`
+	APKSize          int64  `json:"apk_size"`
+	APKSHA256        string `json:"apk_sha256"`
+	ReleaseNotes     string `json:"release_notes"`
+}
+
+// MobileDevice 移动设备登记信息
+type MobileDevice struct {
+	ID           int64  `json:"id"`
+	UserID       int64  `json:"user_id"`
+	TenantCode   string `json:"tenant_code"`
+	DeviceID     string `json:"device_id"`
+	DeviceModel  string `json:"device_model"`
+	OSVersion    string `json:"os_version"`
+	AppVersion   string `json:"app_version"`
+	PushToken    string `json:"push_token"`
+	LastActiveAt string `json:"last_active_at"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// MobileWarehouseStock 扫码查询的单个仓库库存状态
+type MobileWarehouseStock struct {
+	WarehouseID   int64  `json:"warehouse_id"`
+	WarehouseCode string `json:"warehouse_code"`
+	WarehouseName string `json:"warehouse_name"`
+	Quantity      string `json:"quantity"`
+	Reserved      string `json:"reserved"`
+	Available     string `json:"available"`
+}
+
+// MobileScanResult 移动端 PDA / 摄像头扫码商品返回
+type MobileScanResult struct {
+	Product        Master                 `json:"product"`
+	Warehouses     []MobileWarehouseStock `json:"warehouses"`
+	TotalQuantity  string                 `json:"total_quantity"`
+	TotalReserved  string                 `json:"total_reserved"`
+	TotalAvailable string                 `json:"total_available"`
+	DefaultPrice   string                 `json:"default_price"`
+}
+
+// MobileDashboard 移动端轻量看板
+type MobileDashboard struct {
+	TodaySalesAmount     string `json:"today_sales_amount"`
+	TodayOrdersCount     int    `json:"today_orders_count"`
+	TodayReceiptAmount   string `json:"today_receipt_amount"`
+	LowStockCount        int    `json:"low_stock_count"`
+	PendingApprovalCount int    `json:"pending_approval_count"`
+	TenantCode           string `json:"tenant_code"`
+	TenantName           string `json:"tenant_name"`
+	UserName             string `json:"user_name"`
+}
+
+// QuickInventoryItem 移动快速盘点项
+type QuickInventoryItem struct {
+	ProductID      int64  `json:"product_id"`
+	CountedQuantity string `json:"counted_quantity"` // 实盘数量
+	Batch          string `json:"batch"`
+	Note           string `json:"note"`
+}
+
+// QuickOrderItem 移动快速开单项
+type QuickOrderItem struct {
+	ProductID int64  `json:"product_id"`
+	Quantity  string `json:"quantity"`
+	Price     string `json:"price"`
+	Batch     string `json:"batch"`
+	Note      string `json:"note"`
 }

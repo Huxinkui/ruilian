@@ -85,7 +85,7 @@ func VerifyBackup(path string) (string, int64, error) {
 	if e = db.QueryRow("PRAGMA user_version").Scan(&version); e != nil {
 		return "", 0, e
 	}
-	if version != 1 {
+	if version < 1 || version > TargetSchemaVersion {
 		return "", 0, fmt.Errorf("备份数据库版本不兼容")
 	}
 	for _, table := range []string{"settings", "users", "roles", "base_records", "documents", "document_items", "inventory", "inventory_transactions", "inventory_serials", "stock_reservations", "bills", "settlements", "writeoffs", "bill_offsets", "settlement_offsets", "price_rules", "system_installation", "license_local", "operation_log", "backup_records", "background_jobs"} {

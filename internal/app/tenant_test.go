@@ -245,6 +245,7 @@ func tenantAPIRequest(t *testing.T, router http.Handler, method, path string, bo
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", uid())
 	request.Header.Set("X-Tenant-Code", tenantCode)
+	request.Header.Set("X-Impersonate-Mode", "readwrite")
 	for _, cookie := range cookies {
 		if cookie.Name != "ruilian_tenant" {
 			request.AddCookie(cookie)
@@ -448,3 +449,229 @@ func TestTenantXuyonghongLoginAndMultiTenantIsolation(t *testing.T) {
 		t.Fatalf("branch_gz login data mismatch: %+v", resGz)
 	}
 }
+
+func TestReopenTenantSandboxWithV2SchemaVersion(t *testing.T) {
+	dataDir := t.TempDir()
+	a, err := Open(dataDir, licensecode.PublicKeyPEM, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if err := a.EnsureDefaultAccount(); err != nil {
+		t.Fatal(err)
+	}
+
+	router := a.Router(fstest.MapFS{"index.html": {Data: []byte("<html></html>")}})
+
+	// 1. 创建租户并确保其 Schema 版本升级到 TargetSchemaVersion (2)
+	tCode := "tenant_v2_reopen"
+	_, err = a.TenantManager.CreateTenant(tCode, "V2重开测试租户", 200, "V2-Pass-123456", "测试")
+	if err != nil {
+		t.Fatalf("failed to create tenant: %v", err)
+	}
+
+	inst, err := a.TenantManager.GetOrOpenTenant(tCode)
+	if err != nil {
+		t.Fatalf("first open failed: %v", err)
+	}
+	var ver int
+	_ = inst.App.DB.QueryRow("PRAGMA user_version").Scan(&ver)
+	if ver != TargetSchemaVersion {
+		t.Fatalf("expected user_version %d, got %d", TargetSchemaVersion, ver)
+	}
+
+	// 2. 模拟 LRU 缓存淘汰或服务重启：从活跃连接池中彻底剔除并关闭连接
+	a.TenantManager.mu.Lock()
+	inst.App.Close()
+	delete(a.TenantManager.instances, tCode)
+	delete(a.TenantManager.handlers, tCode)
+	a.TenantManager.mu.Unlock()
+
+	// 3. 再次重新打开该物理数据库（此时数据库 user_version 已经是 2）
+	reopenedInst, err := a.TenantManager.GetOrOpenTenant(tCode)
+	if err != nil {
+		t.Fatalf("reopening tenant with user_version=%d failed: %v", TargetSchemaVersion, err)
+	}
+	defer reopenedInst.App.Close()
+
+	var reVer int
+	_ = reopenedInst.App.DB.QueryRow("PRAGMA user_version").Scan(&reVer)
+	if reVer != TargetSchemaVersion {
+		t.Fatalf("expected user_version %d after reopen, got %d", TargetSchemaVersion, reVer)
+	}
+
+	// 4. 验证重新打开后 HTTP 登录与数据访问正常无误
+	respLogin, _ := apiRequest(t, router, "POST", "/api/auth/login", M{
+		"username": tCode,
+		"password": "V2-Pass-123456",
+	}, nil, "")
+	if respLogin.Code != 200 {
+		t.Fatalf("login on reopened tenant failed: %s", respLogin.Body.String())
+	}
+}
+
+func TestTenantArchiveLifecycleAndPurge(t *testing.T) {
+	dataDir := t.TempDir()
+	a, err := Open(dataDir, licensecode.PublicKeyPEM, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if err := a.EnsureDefaultAccount(); err != nil {
+		t.Fatal(err)
+	}
+
+	router := a.Router(fstest.MapFS{"index.html": {Data: []byte("<html></html>")}})
+
+	// 登录超级管理员 huxinkui
+	respLogin, cookies := apiRequest(t, router, "POST", "/api/auth/login", M{
+		"username": MasterAdminUsername,
+		"password": DefaultAdminPassword,
+	}, nil, "")
+	if respLogin.Code != 200 {
+		t.Fatalf("login huxinkui failed: %s", respLogin.Body.String())
+	}
+	var loginData struct {
+		Data struct {
+			Token string `json:"token"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(respLogin.Body.Bytes(), &loginData)
+	token := loginData.Data.Token
+
+	// 1. 创建待测试租户
+	code := "corp_archive_test"
+	_, err = a.TenantManager.CreateTenant(code, "归档测试分部", 200, "Pass123456", "测试归档与彻底清除")
+	if err != nil {
+		t.Fatalf("create tenant failed: %v", err)
+	}
+
+	tenantDir := filepath.Join(dataDir, "tenants", code)
+	if _, err := os.Stat(tenantDir); err != nil {
+		t.Fatalf("expected tenant dir %s to exist", tenantDir)
+	}
+
+	doDelete := func(targetCode string, body M) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("DELETE", "/api/system/tenants/"+targetCode, bytes.NewBufferString(js(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	// 2. 错误二级确认密码：应返回 400 业务错误，包含明确提示，绝不能报 500
+	respWrongPwd := doDelete(code, M{
+		"confirm_password": "wrong-admin-password",
+	})
+	if respWrongPwd.Code != 400 {
+		t.Fatalf("expected 400 for wrong password, got %d: %s", respWrongPwd.Code, respWrongPwd.Body.String())
+	}
+	if !strings.Contains(respWrongPwd.Body.String(), "管理员二级确认密码错误") {
+		t.Fatalf("expected error message to mention wrong password, got %s", respWrongPwd.Body.String())
+	}
+
+	// 3. 正确密码归档：应生成 tar.gz，SHA256，移除物理目录，标记 status='archived'
+	respArchive := doDelete(code, M{
+		"confirm_password": DefaultAdminPassword,
+	})
+	if respArchive.Code != 200 {
+		t.Fatalf("archive tenant failed with %d: %s", respArchive.Code, respArchive.Body.String())
+	}
+	var archiveRes struct {
+		Data struct {
+			ArchiveFile string `json:"archive_file"`
+			ArchiveName string `json:"archive_name"`
+			SHA256      string `json:"sha256"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(respArchive.Body.Bytes(), &archiveRes)
+	if archiveRes.Data.ArchiveFile == "" || archiveRes.Data.ArchiveName == "" || len(archiveRes.Data.SHA256) != 64 {
+		t.Fatalf("archive response missing fields: %+v", archiveRes)
+	}
+	archivePath := filepath.Join(dataDir, "backups", "archive", archiveRes.Data.ArchiveFile)
+	if _, err := os.Stat(archivePath); err != nil {
+		t.Fatalf("archive tar.gz file not found: %s", archivePath)
+	}
+	// 验证物理沙箱已被安全销毁
+	if _, err := os.Stat(tenantDir); !os.IsNotExist(err) {
+		t.Fatalf("tenant physical dir %s should have been removed", tenantDir)
+	}
+	// 验证主库状态为 archived
+	tInfo, err := a.TenantManager.GetTenant(code)
+	if err != nil {
+		t.Fatalf("get tenant failed: %v", err)
+	}
+	if tInfo.Status != "archived" {
+		t.Fatalf("expected status 'archived', got %s", tInfo.Status)
+	}
+
+	// 4. 对已归档租户重复点击归档：应返回 400 友好业务提示，绝不能抛 500 "操作失败，请查看日志或联系管理员"
+	respReArchive := doDelete(code, M{
+		"confirm_password": DefaultAdminPassword,
+	})
+	if respReArchive.Code != 400 {
+		t.Fatalf("expected 400 for re-archiving, got %d: %s", respReArchive.Code, respReArchive.Body.String())
+	}
+	if !strings.Contains(respReArchive.Body.String(), "已经归档冷备") {
+		t.Fatalf("expected friendly message for re-archive, got: %s", respReArchive.Body.String())
+	}
+
+	// 5. 对已归档租户执行其他操作：应全部安全拦截并返回 400
+	if err := a.TenantManager.SetTenantStatus(code, "active"); err == nil {
+		t.Fatal("enabling archived tenant should fail")
+	}
+	if err := a.TenantManager.ResetTenantPassword(code, "NewPass1234"); err == nil {
+		t.Fatal("resetting password on archived tenant should fail")
+	}
+	if _, err := a.TenantManager.InspectTenant(code); err == nil {
+		t.Fatal("inspecting archived tenant should fail")
+	}
+	if _, err := a.TenantManager.CreateImpersonation(MasterAdminUsername, code, "readonly", "127.0.0.1"); err == nil {
+		t.Fatal("impersonating archived tenant should fail")
+	}
+
+	// 6. 对已归档租户执行彻底清除 (purge=true)
+	respPurge := doDelete(code, M{
+		"confirm_password": DefaultAdminPassword,
+		"purge":            true,
+	})
+	if respPurge.Code != 200 {
+		t.Fatalf("purge archived tenant failed with %d: %s", respPurge.Code, respPurge.Body.String())
+	}
+	// 验证主库记录已被彻底清除
+	var cnt int
+	_ = a.DB.QueryRow("SELECT COUNT(*) FROM tenants WHERE code=?", code).Scan(&cnt)
+	if cnt != 0 {
+		t.Fatalf("tenant record should be purged from database, found %d", cnt)
+	}
+	// 验证冷备归档文件依然安全保留
+	if _, err := os.Stat(archivePath); err != nil {
+		t.Fatalf("cold backup archive must be preserved after purge: %s", archivePath)
+	}
+
+	// 7. 测试物理目录已被手工删除/缺失的租户归档容错性
+	codeMissingDir := "corp_missing_dir"
+	_, err = a.TenantManager.CreateTenant(codeMissingDir, "缺失目录租户", 200, "Pass123456", "测试缺失目录")
+	if err != nil {
+		t.Fatalf("create tenant failed: %v", err)
+	}
+	_ = os.RemoveAll(filepath.Join(dataDir, "tenants", codeMissingDir))
+	// 归档缺失目录的租户：不应报 500，应平滑置为 archived 状态
+	respMissingArchive := doDelete(codeMissingDir, M{
+		"confirm_password": DefaultAdminPassword,
+	})
+	if respMissingArchive.Code != 200 {
+		t.Fatalf("expected 200 for archiving tenant with missing dir, got %d: %s", respMissingArchive.Code, respMissingArchive.Body.String())
+	}
+	tMissing, _ := a.TenantManager.GetTenant(codeMissingDir)
+	if tMissing.Status != "archived" {
+		t.Fatalf("expected status 'archived', got %s", tMissing.Status)
+	}
+}
+

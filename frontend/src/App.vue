@@ -2,9 +2,9 @@
 import { computed, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { DataBoard, Box, ShoppingCart, Sell, House, Wallet, PriceTag, TrendCharts, Bell, Setting, Search, ArrowDown, Refresh, QuestionFilled, ArrowRight, SwitchButton, Lock, Fold, Expand, OfficeBuilding, Monitor } from '@element-plus/icons-vue'
+import { DataBoard, Box, ShoppingCart, Sell, House, Wallet, PriceTag, TrendCharts, Bell, Setting, Search, ArrowDown, Refresh, QuestionFilled, ArrowRight, SwitchButton, Lock, Fold, Expand, OfficeBuilding, Monitor, WarningFilled } from '@element-plus/icons-vue'
 import { useApp } from './store'
-import { api } from './api'
+import { api, setToken, setTenantCode } from './api'
 import Login from './components/Login.vue'
 import BrandMark from './components/BrandMark.vue'
 import DocEditor from './components/DocEditor.vue'
@@ -13,7 +13,7 @@ const collapsed = ref(false), searchOpen = ref(false), keyword = ref(''), search
 const password = reactive({ old_password: '', new_password: '' })
 const isMasterAdmin = computed(() => app.isMasterAdmin)
 const isMasterAdminInMain = computed(() => {
-  return (app.user?.username === 'huxinkui' || app.isMasterAdmin) && (app.tenant?.code === 'default' || !app.tenant?.code)
+  return (app.user?.username === 'huxinkui' || app.isMasterAdmin) && (app.tenant?.code === 'default' || !app.tenant?.code) && !app.isImpersonating
 })
 async function handleSwitchTenant(code: string) {
   try {
@@ -21,6 +21,15 @@ async function handleSwitchTenant(code: string) {
     ElMessage.success(`已切换至租户空间：${app.tenant?.name || code}`)
   } catch (err: any) {
     ElMessage.error(err?.message || '切换租户空间失败')
+  }
+}
+async function handleExitImpersonation() {
+  try {
+    await app.exitImpersonation()
+    ElMessage.success('已安全退出跨空间巡检，已返回平台总控台')
+    router.push('/')
+  } catch (err: any) {
+    ElMessage.error(err?.message || '退出巡检失败')
   }
 }
 const nav = computed(() => {
@@ -53,15 +62,23 @@ let timer: ReturnType<typeof setTimeout>, refreshTimer: ReturnType<typeof setInt
 watch(keyword, value => { clearTimeout(timer); if (!value.trim()) { searchRows.value = []; return } timer = setTimeout(async () => { searchBusy.value = true; try { searchRows.value = await api('/search?q=' + encodeURIComponent(value)) } catch {} finally { searchBusy.value = false } }, 250) })
 function selectResult(row: any) { searchOpen.value = false; if (row.type === 'document') app.openDoc(row.id); else router.push({ path: '/masters/' + row.kind, query: { search: row.name } }) }
 function onKey(e: KeyboardEvent) { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); if (app.user) searchOpen.value = true } }
-function sessionExpired() { app.user = null; app.editor.visible = false }
+function resetSessionState() {
+  setToken('')
+  setTenantCode('')
+  app.user = null
+  app.tenantList = []
+  app.tenant = { code: 'default', name: '默认租户', max_storage_mb: 500, used_storage_mb: 0, storage_percent: 0 }
+  app.editor.visible = false
+  router.replace('/')
+}
+function sessionExpired() { resetSessionState() }
 function reconnect() { window.location.reload() }
 async function menu(command: string) {
   if (command === 'shutdown' && desktop) { await desktop.quit(); return }
   if (command === 'password') { password.old_password = ''; password.new_password = ''; passwordOpen.value = true; return }
-  if (command === 'logout') { try { await api('/auth/logout', 'POST') } finally { app.user = null; app.editor.visible = false } }
-  if (command === 'shutdown') { try { await ElMessageBox.confirm('停止后可再次双击 EXE 启动。正在编辑且未保存的内容将不会保留。', '停止本机服务', { type: 'warning', confirmButtonText: '停止服务' }); await api('/system/shutdown', 'POST'); stopped.value = true } catch {} }
+  if (command === 'logout') { try { await api('/auth/logout', 'POST') } finally { resetSessionState() } }
 }
-async function changePassword() { busy.value = true; try { await api('/auth/password', 'POST', password); passwordOpen.value = false; app.user = null; ElMessage.success('密码已修改，请重新登录') } catch {} finally { busy.value = false } }
+async function changePassword() { busy.value = true; try { await api('/auth/password', 'POST', password); passwordOpen.value = false; resetSessionState(); ElMessage.success('密码已修改，请重新登录') } catch {} finally { busy.value = false } }
 onMounted(async () => { window.addEventListener('keydown', onKey); window.addEventListener('session-expired', sessionExpired); try { await app.bootstrap() } catch { bootstrapError.value = true }; refreshTimer = setInterval(() => { if (app.user && !stopped.value) { app.changed() } }, 60000) })
 onBeforeUnmount(() => { clearTimeout(timer); clearInterval(refreshTimer); window.removeEventListener('keydown', onKey); window.removeEventListener('session-expired', sessionExpired) })
 </script>
@@ -89,6 +106,22 @@ onBeforeUnmount(() => { clearTimeout(timer); clearInterval(refreshTimer); window
       </div>
     </aside>
     <div class="main-shell">
+      <!-- 超级管理员跨空间穿透巡检警示横幅 -->
+      <div v-if="app.isImpersonating" class="impersonation-warning-bar">
+        <div class="imp-content">
+          <el-icon class="imp-icon"><WarningFilled /></el-icon>
+          <div class="imp-text">
+            <b>【超级管理员跨空间巡检中】</b>
+            当前租户空间：<span class="imp-highlight">{{ app.tenant?.name || app.impersonatedTenant }} [{{ app.impersonatedTenant }}]</span>
+            <span class="imp-sep">|</span>
+            巡检模式：<el-tag size="small" :type="app.impersonationMode === 'readonly' ? 'warning' : 'danger'" effect="dark">{{ app.impersonationMode === 'readonly' ? '只读巡检 (安全拦截写操作)' : '运维排障读写 (写操作已代维审计)' }}</el-tag>
+            <span class="imp-sep">|</span>
+            临时凭证：<b>30分钟有效</b>
+          </div>
+        </div>
+        <el-button type="danger" size="small" plain @click="handleExitImpersonation">一键退出巡检 · 返回平台总控台</el-button>
+      </div>
+
       <header class="topbar">
         <div class="topbar-left">
           <el-button text circle :icon="collapsed ? Expand : Fold" aria-label="收起导航" @click="collapsed = !collapsed"/>
@@ -110,7 +143,6 @@ onBeforeUnmount(() => { clearTimeout(timer); clearInterval(refreshTimer); window
                 <el-dropdown-item command="password" :icon="Lock">修改密码</el-dropdown-item>
                 <el-dropdown-item command="logout" :icon="SwitchButton">退出登录</el-dropdown-item>
                 <el-dropdown-item v-if="desktop" command="shutdown" divided>退出软件</el-dropdown-item>
-                <el-dropdown-item v-else-if="app.can('system.settings')" command="shutdown" divided>停止服务端</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -187,5 +219,43 @@ onBeforeUnmount(() => { clearTimeout(timer); clearInterval(refreshTimer); window
 }
 .tenant-active-tag {
   font-weight: 600;
+}
+.impersonation-warning-bar {
+  background: linear-gradient(90deg, #7c2d12 0%, #991b1b 100%);
+  color: #fff;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  font-size: 13px;
+}
+.imp-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.imp-icon {
+  font-size: 18px;
+  color: #fde047;
+  animation: pulse 2s infinite;
+}
+.imp-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.imp-highlight {
+  color: #fef08a;
+  font-weight: bold;
+}
+.imp-sep {
+  color: rgba(255, 255, 255, 0.4);
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.1); }
 }
 </style>

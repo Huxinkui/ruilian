@@ -94,11 +94,6 @@ func sqliteURIPath(path string) string {
 	return p
 }
 func (a *App) write(fn func(*sql.Tx) error) error {
-	if a.TenantManager != nil {
-		if err := a.TenantManager.CheckStorageQuota(a.TenantCode); err != nil {
-			return err
-		}
-	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	tx, e := a.DB.Begin()
@@ -109,7 +104,13 @@ func (a *App) write(fn func(*sql.Tx) error) error {
 	if e = fn(tx); e != nil {
 		return e
 	}
-	return tx.Commit()
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	if a.TenantManager != nil {
+		a.TenantManager.UpdateTenantLastModified(a.TenantCode)
+	}
+	return nil
 }
 
 func (a *App) migrate() error {
@@ -117,7 +118,7 @@ func (a *App) migrate() error {
 	if e := a.DB.QueryRow("PRAGMA user_version").Scan(&version); e != nil {
 		return e
 	}
-	if version > 1 {
+	if version > TargetSchemaVersion {
 		return fmt.Errorf("数据库来自较新的软件版本，不能使用当前程序打开")
 	}
 	return a.write(func(tx *sql.Tx) error {
@@ -136,7 +137,9 @@ func (a *App) migrate() error {
 				return e
 			}
 		}
-		_, e = tx.Exec("PRAGMA user_version=1")
+		if version == 0 {
+			_, e = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", TargetSchemaVersion))
+		}
 		return e
 	})
 }
@@ -155,7 +158,11 @@ func settingString(q Queryer, key string) string {
 }
 func settingBool(q Queryer, key string) bool { return setting(q, key) == "true" }
 func audit(q Queryer, u User, ip, action, entity string, id int64, before, after any) error {
-	_, e := q.Exec("INSERT INTO operation_log(user_id,username,ip,action,entity,entity_id,before_data,after_data,created_at) VALUES(?,?,?,?,?,?,?,?,?)", u.ID, u.Username, ip, action, entity, id, js(before), js(after), stamp())
+	uname := u.Username
+	if u.IsImpersonating || (strings.HasPrefix(uname, "huxinkui") && uname != "huxinkui") {
+		uname = "huxinkui (平台管理员代维)"
+	}
+	_, e := q.Exec("INSERT INTO operation_log(user_id,username,ip,action,entity,entity_id,before_data,after_data,created_at) VALUES(?,?,?,?,?,?,?,?,?)", u.ID, uname, ip, action, entity, id, js(before), js(after), stamp())
 	return e
 }
 func (a *App) recordError(action string, err error) { a.Logger.Printf("%s: %v", action, err) }
@@ -199,6 +206,11 @@ CREATE TABLE IF NOT EXISTS system_installation(id INTEGER PRIMARY KEY CHECK(id=1
 CREATE TABLE IF NOT EXISTS license_local(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL,signature TEXT NOT NULL,activated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS license_activation_log(id INTEGER PRIMARY KEY AUTOINCREMENT,license_id TEXT NOT NULL,success INTEGER NOT NULL,message TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS license_event_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL,message TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS app_versions(id INTEGER PRIMARY KEY AUTOINCREMENT,platform TEXT NOT NULL,version_name TEXT NOT NULL,version_code INTEGER NOT NULL,min_supported_code INTEGER NOT NULL DEFAULT 1,download_url TEXT NOT NULL DEFAULT '',apk_size INTEGER NOT NULL DEFAULT 0,apk_sha256 TEXT NOT NULL DEFAULT '',release_notes TEXT NOT NULL DEFAULT '',is_latest INTEGER NOT NULL DEFAULT 1,published_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_app_ver_platform ON app_versions(platform,version_code);
+CREATE TABLE IF NOT EXISTS mobile_devices(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,tenant_code TEXT NOT NULL DEFAULT 'default',device_id TEXT NOT NULL,device_model TEXT NOT NULL DEFAULT '',os_version TEXT NOT NULL DEFAULT '',app_version TEXT NOT NULL DEFAULT '',push_token TEXT NOT NULL DEFAULT '',last_active_at TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(tenant_code,device_id));
+CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_code TEXT NOT NULL DEFAULT 'default',user_id INTEGER NOT NULL,document_id INTEGER DEFAULT 0,entity_type TEXT NOT NULL DEFAULT '',entity_id INTEGER DEFAULT 0,filename TEXT NOT NULL,file_path TEXT NOT NULL,file_size INTEGER NOT NULL,mime_type TEXT NOT NULL,sha256 TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_attachments_entity ON attachments(tenant_code,entity_type,entity_id);
 `
 
 func (a *App) cleanSessions() {

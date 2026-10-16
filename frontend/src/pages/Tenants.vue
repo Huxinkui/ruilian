@@ -20,11 +20,20 @@ import {
   ArrowRight,
   Monitor,
   Coin,
-  Cpu
+  Cpu,
+  View,
+  Tools,
+  Delete,
+  Files,
+  Aim,
+  WarningFilled,
+  ArrowDown,
+  User,
+  DataBoard
 } from '@element-plus/icons-vue'
 import { api } from '../api'
 import { useApp } from '../store'
-import { dateTime } from '../utils'
+import { dateTime, money } from '../utils'
 
 const app = useApp()
 const router = useRouter()
@@ -45,6 +54,37 @@ const tenantOpen = ref(false)
 const editOpen = ref(false)
 const storageOpen = ref(false)
 const pwdOpen = ref(false)
+
+// 穿透巡检弹窗
+const impOpen = ref(false)
+const impForm = reactive({
+  code: '',
+  name: '',
+  mode: 'readonly'
+})
+
+// 租户画像/详情抽屉
+const inspectDrawer = ref(false)
+const inspectLoading = ref(false)
+const inspectData = ref<any>(null)
+
+// 空间维护弹窗
+const maintOpen = ref(false)
+const maintForm = reactive({
+  code: '',
+  name: '',
+  action: 'checkpoint'
+})
+
+// 空间归档/彻底清除弹窗
+const archiveOpen = ref(false)
+const archiveForm = reactive({
+  code: '',
+  name: '',
+  confirm_password: '',
+  is_purge: false
+})
+const archiveResult = ref<any>(null)
 
 // 新建租户表单
 const tenantForm = reactive({
@@ -87,6 +127,11 @@ const quotaPresets = [
 ]
 
 async function load() {
+  const isMaster = !!app.user && (app.user.username === 'huxinkui' || app.user.is_master_admin) && (app.tenant?.code === 'default' || !app.tenant?.code)
+  if (!isMaster) {
+    router.replace('/')
+    return
+  }
   busy.value = true
   try {
     const res = await api('/system/tenants')
@@ -108,9 +153,10 @@ async function load() {
 onMounted(load)
 watch(() => app.tick, load)
 
-// 活跃与告警统计
+// 活跃、停用与归档统计
 const activeCount = computed(() => tenants.value.filter(t => t.status === 'active').length)
-const disabledCount = computed(() => tenants.value.filter(t => t.status === 'disabled').length)
+const disabledCount = computed(() => tenants.value.filter(t => t.status === 'disabled' || t.status === 'suspended').length)
+const archivedCount = computed(() => tenants.value.filter(t => t.status === 'archived').length)
 const warningTenants = computed(() => {
   return tenants.value.filter(t => {
     if (!t.max_storage_mb || t.max_storage_mb <= 0) return false
@@ -137,7 +183,7 @@ const filteredTenants = computed(() => {
       (t.note && t.note.toLowerCase().includes(q))
 
     // 状态过滤
-    const matchStatus = !statusFilter.value || t.status === statusFilter.value
+    const matchStatus = !statusFilter.value || t.status === statusFilter.value || (statusFilter.value === 'disabled' && (t.status === 'disabled' || t.status === 'suspended'))
 
     // 配额状态过滤
     let matchStorage = true
@@ -328,6 +374,111 @@ async function enterTenant(row: any) {
     ElMessage.error(err?.message || '切换租户空间失败')
   }
 }
+
+function openImpersonate(row: any) {
+  impForm.code = row.code
+  impForm.name = row.name
+  impForm.mode = 'readonly'
+  impOpen.value = true
+}
+
+async function confirmImpersonate() {
+  saving.value = true
+  try {
+    const res = await api(`/system/tenants/${impForm.code}/impersonate`, 'POST', {
+      mode: impForm.mode
+    })
+    app.startImpersonation(res.tenant_code || impForm.code, res.access_mode || impForm.mode, res.token)
+    ElMessage.success(`已开启对租户【${impForm.name}】的${impForm.mode === 'readonly' ? '只读巡检' : '运维排障读写'}会话（临时凭证30分钟内有效）`)
+    impOpen.value = false
+    await router.push('/')
+  } catch (err: any) {
+    ElMessage.error(err?.message || '发起跨空间巡检失败')
+  } finally {
+    saving.value = false
+  }
+}
+
+async function openInspect(row: any) {
+  inspectData.value = null
+  inspectDrawer.value = true
+  inspectLoading.value = true
+  try {
+    const res = await api(`/system/tenants/${row.code}/inspect`)
+    inspectData.value = res
+  } catch (err: any) {
+    ElMessage.error(err?.message || '获取租户运行画像失败')
+  } finally {
+    inspectLoading.value = false
+  }
+}
+
+function openMaintenance(row: any) {
+  maintForm.code = row.code
+  maintForm.name = row.name
+  maintForm.action = 'checkpoint'
+  maintOpen.value = true
+}
+
+async function executeMaintenance() {
+  saving.value = true
+  try {
+    const res = await api(`/system/tenants/${maintForm.code}/maintenance`, 'POST', {
+      action: maintForm.action
+    })
+    ElMessage.success(res.message || '空间维护任务已执行成功')
+    maintOpen.value = false
+    await load()
+  } catch (err: any) {
+    ElMessage.error(err?.message || '空间维护失败')
+  } finally {
+    saving.value = false
+  }
+}
+
+function openArchive(row: any) {
+  archiveForm.code = row.code
+  archiveForm.name = row.name
+  archiveForm.confirm_password = ''
+  archiveForm.is_purge = false
+  archiveResult.value = null
+  archiveOpen.value = true
+}
+
+function openPurge(row: any) {
+  archiveForm.code = row.code
+  archiveForm.name = row.name
+  archiveForm.confirm_password = ''
+  archiveForm.is_purge = true
+  archiveResult.value = null
+  archiveOpen.value = true
+}
+
+async function executeArchive() {
+  if (!archiveForm.confirm_password) {
+    ElMessage.warning('请输入平台管理员二级确认密码')
+    return
+  }
+  saving.value = true
+  try {
+    const res = await api(`/system/tenants/${archiveForm.code}`, 'DELETE', {
+      confirm_password: archiveForm.confirm_password,
+      purge: archiveForm.is_purge
+    })
+    archiveResult.value = res
+    if (archiveForm.is_purge) {
+      ElMessage.success(`已归档租户【${archiveForm.name}】的注册元数据已彻底清除`)
+      archiveOpen.value = false
+    } else {
+      ElMessage.success(`租户空间【${archiveForm.name}】已成功打包归档并销毁物理沙箱`)
+    }
+    await load()
+  } catch (err: any) {
+    ElMessage.error(err?.message || (archiveForm.is_purge ? '清除记录失败' : '空间归档失败'))
+  } finally {
+    saving.value = false
+  }
+}
 </script>
 
 <template>
@@ -408,7 +559,7 @@ async function enterTenant(row: any) {
         </div>
         <div class="metric-footer">
           <span>
-            运行中 <b>{{ activeCount }}</b> · 停用 <b>{{ disabledCount }}</b>
+            运行中 <b>{{ activeCount }}</b> · 停用 <b>{{ disabledCount }}</b> · 已归档 <b>{{ archivedCount }}</b>
           </span>
           <el-tag size="small" type="success" effect="plain">100% 独立环境</el-tag>
         </div>
@@ -504,6 +655,7 @@ async function enterTenant(row: any) {
             <el-option label="全部状态" value="" />
             <el-option label="正常运行" value="active" />
             <el-option label="已停用" value="disabled" />
+            <el-option label="已归档" value="archived" />
           </el-select>
           <el-select v-model="storageFilter" placeholder="配额健康" clearable style="width: 130px">
             <el-option label="全部配额" value="" />
@@ -543,7 +695,11 @@ async function enterTenant(row: any) {
         <!-- 存储配额与使用情况 -->
         <el-table-column label="存储空间与配额上限" min-width="240">
           <template #default="{ row }">
-            <div class="storage-column">
+            <div v-if="row.status === 'archived'" class="archived-storage-cell">
+              <el-tag size="small" type="info" effect="plain">物理沙箱已安全销毁</el-tag>
+              <div class="muted text-small" style="margin-top: 4px;">数据已完整打包移入归档冷备区</div>
+            </div>
+            <div v-else class="storage-column">
               <div class="storage-text-row">
                 <span class="storage-used">{{ (row.used_storage_mb || row.used_mb || 0).toFixed(2) }} MB</span>
                 <span class="storage-sep">/</span>
@@ -571,22 +727,25 @@ async function enterTenant(row: any) {
         <el-table-column label="物理隔离数据库" min-width="210">
           <template #default="{ row }">
             <div class="db-info-cell">
-              <code class="db-path">{{ row.code === 'default' ? 'data/ruilian.db' : `data/tenants/${row.code}/ruilian.db` }}</code>
+              <code class="db-path" :style="row.status === 'archived' ? 'color: #94a3b8;' : ''">
+                {{ row.code === 'default' ? 'data/ruilian.db' : (row.status === 'archived' ? 'data/backups/archive/ (冷备包)' : `data/tenants/${row.code}/ruilian.db`) }}
+              </code>
               <div class="db-tags">
-                <span class="db-tag">SQLite 3</span>
-                <span class="db-tag">WAL 独立事务</span>
+                <span class="db-tag" v-if="row.status === 'archived'" style="background: #f1f5f9; color: #64748b;">已离线冷备</span>
+                <span class="db-tag" v-else>SQLite 3</span>
+                <span class="db-tag" v-if="row.status !== 'archived'">WAL 独立事务</span>
               </div>
             </div>
           </template>
         </el-table-column>
 
         <!-- 运行状态 -->
-        <el-table-column label="运行状态" width="105">
+        <el-table-column label="运行状态" width="115">
           <template #default="{ row }">
             <div class="status-cell">
-              <span class="status-dot" :class="row.status === 'active' ? 'active' : 'disabled'"></span>
-              <span :class="row.status === 'active' ? 'text-success' : 'text-danger'">
-                {{ row.status === 'active' ? '正常运行' : '已停用' }}
+              <span class="status-dot" :class="row.status === 'active' ? 'active' : (row.status === 'archived' ? 'archived' : 'disabled')"></span>
+              <span :class="row.status === 'active' ? 'text-success' : (row.status === 'archived' ? 'text-archived' : 'text-danger')">
+                {{ row.status === 'active' ? '正常运行' : (row.status === 'archived' ? '已归档' : '已停用') }}
               </span>
             </div>
           </template>
@@ -600,49 +759,75 @@ async function enterTenant(row: any) {
         </el-table-column>
 
         <!-- 操作栏 -->
-        <el-table-column label="管控操作" width="310" fixed="right">
+        <el-table-column label="管控操作" width="350" fixed="right">
           <template #default="{ row }">
             <div class="action-buttons">
-              <el-tag
-                v-if="row.code === (app.tenant?.code || 'default')"
-                type="success"
-                size="small"
-                effect="dark"
-                class="current-tag"
-              >
-                当前管理中
-              </el-tag>
               <el-button
-                v-else
+                v-if="row.code !== 'default' && row.status !== 'archived'"
                 link
-                type="success"
-                :icon="Switch"
-                class="btn-enter"
-                @click="enterTenant(row)"
+                type="warning"
+                :icon="Aim"
+                @click="openImpersonate(row)"
               >
-                进入管理数据
+                巡检空间
               </el-button>
 
-              <el-button link type="primary" :icon="Setting" @click="editStorage(row)">
+              <el-button
+                v-if="row.code !== 'default' && row.status !== 'archived'"
+                link
+                type="primary"
+                :icon="View"
+                @click="openInspect(row)"
+              >
+                画像
+              </el-button>
+
+              <el-button v-if="row.status !== 'archived'" link type="primary" :icon="Setting" @click="editStorage(row)">
                 配额
               </el-button>
 
-              <el-button link type="primary" :icon="Edit" @click="openEdit(row)">
-                编辑
-              </el-button>
-
-              <el-button link type="primary" :icon="Key" @click="resetTenantPwd(row)">
-                重置密码
-              </el-button>
-
-              <el-button
-                v-if="row.code !== 'default'"
-                link
-                :type="row.status === 'active' ? 'danger' : 'success'"
-                @click="toggleTenantStatus(row)"
-              >
-                {{ row.status === 'active' ? '停用' : '启用' }}
-              </el-button>
+              <el-dropdown trigger="click">
+                <el-button link type="info" :icon="Tools">
+                  更多 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <template v-if="row.status !== 'archived'">
+                      <el-dropdown-item :icon="Edit" @click="openEdit(row)">编辑信息</el-dropdown-item>
+                      <el-dropdown-item :icon="Key" @click="resetTenantPwd(row)">重置密码</el-dropdown-item>
+                      <el-dropdown-item v-if="row.code !== 'default'" :icon="Refresh" @click="openMaintenance(row)">空间维护 (WAL/快照)</el-dropdown-item>
+                      <el-dropdown-item
+                        v-if="row.code !== 'default'"
+                        :icon="row.status === 'active' ? Lock : CircleCheck"
+                        @click="toggleTenantStatus(row)"
+                      >
+                        {{ row.status === 'active' ? '停用空间' : '启用空间' }}
+                      </el-dropdown-item>
+                      <el-dropdown-item
+                        v-if="row.code !== 'default'"
+                        divided
+                        style="color: #ef4444;"
+                        :icon="Delete"
+                        @click="openArchive(row)"
+                      >
+                        归档并销毁空间
+                      </el-dropdown-item>
+                    </template>
+                    <template v-else>
+                      <el-dropdown-item disabled :icon="Folder">冷备归档已安全保留</el-dropdown-item>
+                      <el-dropdown-item
+                        v-if="row.code !== 'default'"
+                        divided
+                        style="color: #ef4444;"
+                        :icon="Delete"
+                        @click="openPurge(row)"
+                      >
+                        彻底清除归档记录
+                      </el-dropdown-item>
+                    </template>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </template>
         </el-table-column>
@@ -849,6 +1034,225 @@ async function enterTenant(row: any) {
       <template #footer>
         <el-button @click="pwdOpen = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="saveTenantPwd">立即重置</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 跨空间穿透巡检模式选择弹窗 -->
+    <el-dialog v-model="impOpen" title="发起跨租户空间穿透巡检" width="540px" class="custom-dialog">
+      <div class="imp-dialog-body">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="系统安全巡检提示"
+          description="平台超级管理员（huxinkui）将以全局穿透身份进入目标租户沙箱，系统将签发30分钟有效期的临时运维凭据。"
+          style="margin-bottom: 16px;"
+        />
+        <el-form label-position="top">
+          <el-form-item label="目标租户空间">
+            <el-input :model-value="`${impForm.name} [${impForm.code}]`" disabled />
+          </el-form-item>
+          <el-form-item label="巡检访问模式 *">
+            <el-radio-group v-model="impForm.mode" class="imp-mode-group">
+              <el-radio value="readonly" class="imp-mode-radio">
+                <div class="mode-info">
+                  <div class="mode-title">
+                    <span class="mode-badge blue">🛡️ 只读安全巡检（推荐）</span>
+                  </div>
+                  <div class="mode-desc">
+                    严格拦截一切新增、修改、审核与删除等写操作（HTTP 403 熔断保护），防止意外破坏或污染租户生产数据。
+                  </div>
+                </div>
+              </el-radio>
+              <el-radio value="readwrite" class="imp-mode-radio">
+                <div class="mode-info">
+                  <div class="mode-title">
+                    <span class="mode-badge red">⚠️ 运维排障读写（允许数据修复）</span>
+                  </div>
+                  <div class="mode-desc">
+                    允许执行写操作。系统底层操作审计日志将强制记录为「huxinkui (平台管理员代维)」，操作留痕备查。
+                  </div>
+                </div>
+              </el-radio>
+            </el-radio-group>
+          </el-form-item>
+        </el-form>
+      </div>
+      <template #footer>
+        <el-button @click="impOpen = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="confirmImpersonate">
+          立即签发临时凭证并进入巡检
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 租户指标画像与运行详情抽屉 -->
+    <el-drawer v-model="inspectDrawer" size="680px" title="租户运行画像与宏观指标快照">
+      <div v-loading="inspectLoading" class="inspect-body">
+        <template v-if="inspectData">
+          <div class="inspect-header-card">
+            <div class="inspect-avatar">{{ inspectData.tenant?.name?.slice(0, 1) || '租' }}</div>
+            <div class="inspect-header-info">
+              <h3>{{ inspectData.tenant?.name }} <small>[{{ inspectData.tenant?.code }}]</small></h3>
+              <div class="inspect-tags">
+                <el-tag size="small" :type="inspectData.tenant?.status === 'active' ? 'success' : 'danger'">
+                  {{ inspectData.tenant?.status === 'active' ? '正常运行' : '已停用/冻结' }}
+                </el-tag>
+                <el-tag size="small" type="info">架构版本 V{{ inspectData.tenant?.db_version || 2 }}</el-tag>
+                <el-tag size="small" type="warning">活跃会话: {{ inspectData.active_sessions || 0 }} 个</el-tag>
+              </div>
+            </div>
+          </div>
+
+          <h4 class="inspect-sec-title">📊 业务宏观指标快照（无需扫描子库）</h4>
+          <div class="inspect-metric-grid">
+            <div class="inspect-metric-box">
+              <span class="box-label">单据总数</span>
+              <b class="box-val">{{ inspectData.stats?.doc_count || 0 }}</b>
+            </div>
+            <div class="inspect-metric-box">
+              <span class="box-label">商品品类数</span>
+              <b class="box-val">{{ inspectData.stats?.product_count || 0 }}</b>
+            </div>
+            <div class="inspect-metric-box">
+              <span class="box-label">往来客户数</span>
+              <b class="box-val">{{ inspectData.stats?.customer_count || 0 }}</b>
+            </div>
+            <div class="inspect-metric-box">
+              <span class="box-label">近30天净销售额</span>
+              <b class="box-val text-green">¥ {{ money(inspectData.stats?.net_sales_30d || 0) }}</b>
+            </div>
+            <div class="inspect-metric-box">
+              <span class="box-label">应收账款总额</span>
+              <b class="box-val text-blue">¥ {{ money(inspectData.stats?.total_ar_amount || 0) }}</b>
+            </div>
+            <div class="inspect-metric-box">
+              <span class="box-label">库存资产估值</span>
+              <b class="box-val text-orange">¥ {{ money(inspectData.stats?.total_inventory_val || 0) }}</b>
+            </div>
+          </div>
+
+          <h4 class="inspect-sec-title">💾 物理沙箱与存储配额</h4>
+          <div class="inspect-infra-card">
+            <div class="infra-row">
+              <span>磁盘空间占用：</span>
+              <b>{{ (inspectData.tenant?.used_storage_mb || 0).toFixed(2) }} MB / {{ inspectData.tenant?.max_storage_mb ? inspectData.tenant.max_storage_mb + ' MB' : '不限' }} ({{ (inspectData.tenant?.storage_percent || 0).toFixed(1) }}%)</b>
+            </div>
+            <div class="infra-row">
+              <span>预写日志 (WAL) 大小：</span>
+              <b>{{ ((inspectData.wal?.wal_size_bytes || 0) / 1024).toFixed(1) }} KB</b>
+            </div>
+            <div class="infra-row">
+              <span>最后业务活跃时间：</span>
+              <span>{{ inspectData.stats?.last_active_at ? dateTime(inspectData.stats.last_active_at) : '暂无记录' }}</span>
+            </div>
+            <div class="infra-row">
+              <span>最后备份落盘时间：</span>
+              <span>{{ inspectData.stats?.last_backup_at ? dateTime(inspectData.stats.last_backup_at) : '暂无备份' }}</span>
+            </div>
+          </div>
+
+          <h4 class="inspect-sec-title">📝 最近 20 条租户审计流水</h4>
+          <el-table :data="inspectData.recent_logs || []" size="small" border stripe class="inspect-logs-table">
+            <el-table-column prop="created_at" label="时间" width="145">
+              <template #default="{ row }">
+                <span class="muted text-small">{{ dateTime(row.created_at) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="username" label="操作人" width="130" show-overflow-tooltip />
+            <el-table-column prop="action" label="操作动作" width="110" />
+            <el-table-column prop="client_ip" label="客户端IP" width="110" />
+            <el-table-column prop="details" label="操作详情" min-width="120" show-overflow-tooltip />
+          </el-table>
+        </template>
+      </div>
+    </el-drawer>
+
+    <!-- 空间维护弹窗 -->
+    <el-dialog v-model="maintOpen" title="租户物理沙箱空间维护" width="500px">
+      <el-form label-position="top">
+        <el-form-item label="目标租户空间">
+          <el-input :model-value="`${maintForm.name} [${maintForm.code}]`" disabled />
+        </el-form-item>
+        <el-form-item label="维护任务类型 *">
+          <el-radio-group v-model="maintForm.action" style="display: flex; flex-direction: column; gap: 12px; width: 100%;">
+            <el-radio value="checkpoint">
+              <div>
+                <b>WAL 检查点整理 (PRAGMA wal_checkpoint)</b>
+                <div class="muted text-small">将 WAL 预写日志完全落盘并截断文件句柄，释放临时膨胀空间</div>
+              </div>
+            </el-radio>
+            <el-radio value="snapshot">
+              <div>
+                <b>在线热备快照 (VACUUM INTO)</b>
+                <div class="muted text-small">创建一致性物理只读冷备快照副本，用于安全演练与存档</div>
+              </div>
+            </el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="maintOpen = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="executeMaintenance">执行维护</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 租户归档与物理销毁 / 彻底清除二次确认弹窗 -->
+    <el-dialog v-model="archiveOpen" :title="archiveForm.is_purge ? '彻底清除租户归档记录' : '归档并销毁租户物理空间'" width="520px">
+      <div v-if="!archiveResult">
+        <el-alert
+          v-if="!archiveForm.is_purge"
+          type="error"
+          :closable="false"
+          show-icon
+          title="高危操作警告"
+          description="归档操作将强制关闭租户所有连接池，将物理数据完整压缩打包归档为 tar.gz 并生成 SHA256 校验和，随后彻底删除租户物理数据库目录！"
+          style="margin-bottom: 16px;"
+        />
+        <el-alert
+          v-else
+          type="warning"
+          :closable="false"
+          show-icon
+          title="清理提示"
+          description="该租户物理沙箱此前已完成销毁。确认操作将彻底从平台管理中清除该租户的元数据注册记录（历史生成的冷备归档包仍安全保存在 data/backups/archive/ 中）。"
+          style="margin-bottom: 16px;"
+        />
+        <el-form label-position="top">
+          <el-form-item :label="archiveForm.is_purge ? '拟清除租户' : '拟归档租户'">
+            <el-input :model-value="`${archiveForm.name} [${archiveForm.code}]`" disabled />
+          </el-form-item>
+          <el-form-item label="管理员二级确认密码 *">
+            <el-input
+              v-model="archiveForm.confirm_password"
+              type="password"
+              show-password
+              placeholder="请输入当前 huxinkui 登录密码以确认身份"
+              @keyup.enter="executeArchive"
+            />
+          </el-form-item>
+        </el-form>
+      </div>
+      <div v-else class="archive-result-card">
+        <el-result icon="success" :title="archiveForm.is_purge ? '租户记录已彻底清除' : '租户物理空间已归档完成'">
+          <template #extra>
+            <div class="archive-info-box" v-if="!archiveForm.is_purge">
+              <p><b>归档文件名：</b><code>{{ archiveResult.archive_file || archiveResult.archive_name || '已生成冷备包' }}</code></p>
+              <p v-if="archiveResult.sha256"><b>SHA256 校验和：</b><code>{{ archiveResult.sha256 }}</code></p>
+              <p class="muted">归档包已妥善存放在 <code>data/backups/archive/</code>，物理沙箱已安全下线。</p>
+            </div>
+            <div class="archive-info-box" v-else>
+              <p class="muted">该租户的注册元数据与大盘指标已彻底清除，历史冷备包仍保存在 <code>data/backups/archive/</code>。</p>
+            </div>
+            <el-button type="primary" @click="archiveOpen = false">完成</el-button>
+          </template>
+        </el-result>
+      </div>
+      <template #footer v-if="!archiveResult">
+        <el-button @click="archiveOpen = false">取消</el-button>
+        <el-button type="danger" :loading="saving" @click="executeArchive">
+          {{ archiveForm.is_purge ? '确认彻底清除记录' : '确认归档并销毁空间' }}
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -1169,8 +1573,19 @@ async function enterTenant(row: any) {
   background-color: #ef4444;
 }
 
+.status-dot.archived {
+  background-color: #94a3b8;
+  box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.25);
+}
+
 .text-success { color: #059669; }
 .text-danger { color: #dc2626; }
+.text-archived { color: #64748b; font-weight: 500; }
+
+.archived-storage-cell {
+  display: flex;
+  flex-direction: column;
+}
 
 .action-buttons {
   display: flex;
@@ -1242,4 +1657,146 @@ async function enterTenant(row: any) {
 .ml4 { margin-left: 4px; }
 .mt8 { margin-top: 8px; }
 .text-small { font-size: 11px; }
+
+/* 跨空间巡检与画像抽屉样式 */
+.imp-mode-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+.imp-mode-radio {
+  display: flex;
+  align-items: flex-start;
+  height: auto;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-right: 0 !important;
+}
+.imp-mode-radio.is-checked {
+  border-color: #2563eb;
+  background-color: #f8fafc;
+}
+.mode-info {
+  margin-left: 8px;
+}
+.mode-badge {
+  font-weight: 600;
+  font-size: 13px;
+}
+.mode-badge.blue { color: #2563eb; }
+.mode-badge.red { color: #dc2626; }
+.mode-desc {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.inspect-body {
+  padding: 0 4px;
+}
+.inspect-header-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 20px;
+}
+.inspect-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  font-weight: bold;
+}
+.inspect-header-info h3 {
+  margin: 0 0 6px 0;
+  font-size: 16px;
+  color: #1e293b;
+}
+.inspect-header-info h3 small {
+  color: #64748b;
+  font-size: 13px;
+  font-weight: normal;
+}
+.inspect-tags {
+  display: flex;
+  gap: 6px;
+}
+.inspect-sec-title {
+  margin: 18px 0 10px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+.inspect-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.inspect-metric-box {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+}
+.box-label {
+  font-size: 11px;
+  color: #64748b;
+}
+.box-val {
+  font-size: 15px;
+  margin-top: 4px;
+  color: #0f172a;
+}
+.box-val.text-green { color: #16a34a; }
+.box-val.text-blue { color: #2563eb; }
+.box-val.text-orange { color: #ea580c; }
+.inspect-infra-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.infra-row {
+  display: flex;
+  justify-content: space-between;
+}
+.inspect-logs-table {
+  margin-top: 6px;
+}
+.archive-info-box {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  text-align: left;
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+.archive-info-box code {
+  font-family: monospace;
+  background: #e2e8f0;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #0f172a;
+  word-break: break-all;
+}
 </style>

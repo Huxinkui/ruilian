@@ -21,14 +21,14 @@ export const router = createRouter({
 })
 
 router.beforeEach((to, _from, next) => {
-  if (to.path === '/tenants') {
+  if (to.path === '/tenants' || to.meta?.requiresMasterAdmin) {
     const app = useApp()
-    if (app.user) {
-      const isMaster = (app.user.username === 'huxinkui' || app.user.is_master_admin) && (app.tenant?.code === 'default' || !app.tenant?.code)
-      if (!isMaster) {
-        ElMessage.warning('无权访问：租户空间无权查看多租户管理页面')
-        return next('/')
+    const isMaster = !!app.user && (app.user.username === 'huxinkui' || app.user.is_master_admin) && (app.tenant?.code === 'default' || !app.tenant?.code)
+    if (!isMaster) {
+      if (app.user) {
+        ElMessage.warning('无权访问：仅平台专属超级管理员可访问多租户管理页面')
       }
+      return next('/')
     }
   }
   next()

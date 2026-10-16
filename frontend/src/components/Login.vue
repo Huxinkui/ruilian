@@ -81,12 +81,13 @@ async function login() {
     if (res.tenant_code) {
       setTenantCode(res.tenant_code)
       form.tenant = res.tenant_code === 'default' ? '' : res.tenant_code
+      app.tenant = { code: res.tenant_code, name: res.tenant_code }
     }
+    await router.replace('/')
     if (res.user) app.user = res.user
     if (res.license) app.license = res.license
     await app.refreshMe().catch(() => {})
     ElMessage.success('登录成功')
-    await router.push('/')
   } catch (err: any) {
     const msg = err?.message || '登录失败，请检查用户名、密码或验证码'
     ElMessage.error(msg)
